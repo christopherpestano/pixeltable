@@ -22,12 +22,21 @@ if TYPE_CHECKING:
 
 
 class ExecProfile:
+    """Collects per-expression execution timing for performance analysis.
+
+    Used during expression evaluation to measure how long each expression takes.
+    Useful for identifying slow UDFs or expensive computed columns.
+    """
+
     def __init__(self, row_builder: RowBuilder):
+        # Total time spent evaluating each expression (indexed by slot_idx)
         self.eval_time = [0.0] * row_builder.num_materialized
+        # Number of times each expression was evaluated
         self.eval_count = [0] * row_builder.num_materialized
         self.row_builder = row_builder
 
     def print(self, num_rows: int) -> None:
+        """Print per-expression timing statistics."""
         for i in range(self.row_builder.num_materialized):
             if self.eval_count[i] == 0:
                 continue
@@ -40,7 +49,10 @@ class ExecProfile:
 
 
 class ColumnSlotIdx(NamedTuple):
-    """Info for how to locate materialized column in DataRow
+    """Maps a catalog Column to its slot index in DataRow for value retrieval.
+
+    Used when writing row data back to storage - maps database columns to their
+    corresponding expression slots.
     TODO: can this be integrated into RowBuilder directly?
     """
 
@@ -49,7 +61,18 @@ class ColumnSlotIdx(NamedTuple):
 
 
 class RowBuilder:
-    """Create and populate DataRows and table rows from exprs and computed columns
+    """Central coordinator for expression evaluation - manages the expression DAG and DataRow creation.
+
+    RowBuilder performs several critical functions:
+    1. **Expression Registration**: Deduplicates expressions and assigns unique slot indices
+    2. **Dependency Tracking**: Maintains the DAG of expression dependencies for evaluation ordering
+    3. **DataRow Factory**: Creates properly configured DataRow instances with correct slot counts
+    4. **Evaluation Context**: Provides EvalCtx objects that define which expressions to evaluate
+    5. **Table Row Creation**: Converts evaluated DataRows into database-storable format
+
+    The expression DAG is built during construction by recursively processing output_exprs
+    and their dependencies. Each unique expression gets a slot_idx, and the DAG is stored
+    as adjacency matrices (dependencies, dependents, transitive_dependents) for efficient lookup.
 
     For ColumnRefs to unstored iterator columns:
     - in order for them to be executable, we also record the iterator args and pass them to the ColumnRef
@@ -61,8 +84,12 @@ class RowBuilder:
     TODO: enforce that output_exprs doesn't overlap with input_exprs?
     """
 
+    # === Expression DAG ===
+    # All unique expressions in topological order (dependencies before dependents)
     unique_exprs: ExprSet
+    # Counter for assigning sequential slot indices
     next_slot_idx: int
+    # Slots that contain pre-computed input values (excluded from evaluation)
     input_expr_slot_idxs: set[int]
 
     # output exprs: all exprs the caller wants to materialize
@@ -75,28 +102,32 @@ class RowBuilder:
     tbl: catalog.TableVersion | None  # reference table of the RowBuilder; used to identify pk columns for writes
     for_view_load: bool  # True if this RowBuilder represents a view load
 
+    # Maps columns to their expression slot index (None if value comes from cell_vals, not expr evaluation)
     table_columns: dict[catalog.Column, int | None]  # value: slot idx, if the result of an expr
     default_eval_ctx: EvalCtx
     unstored_iter_args: dict[UUID, Expr]
     unstored_iter_outputs: dict[UUID, list['ColumnRef']]
 
-    # transitive dependents for the purpose of exception propagation: an exception for slot i is propagated to
-    # _exc_dependents[i]
+    # === Exception Propagation ===
+    # When slot i raises an exception, it propagates to all slots in _exc_dependents[i]
     # (list of set of slot_idxs, indexed by slot_idx)
     _exc_dependents: list[set[int]]
 
-    # dependents[i] = direct dependents of expr with slot idx i; dependents[i, j] == True: expr j depends on expr i
+    # === Dependency Matrices (num_slots x num_slots boolean arrays) ===
+    # dependents[i, j] == True means expression j directly depends on expression i
     dependents: np.ndarray  # of bool
+    # transitive_dependents[i] includes all expressions that transitively depend on i
     transitive_dependents: np.ndarray  # of bool
-    # dependencies[i] = direct dependencies of expr with slot idx i; transpose of dependents
+    # dependencies[i, j] == True means expression i directly depends on expression j (transpose of dependents)
     dependencies: np.ndarray  # of bool
-    # num_dependencies[i] = number of direct dependencies of expr with slot idx i
+    # Count of direct dependencies per slot (used to determine when all deps are ready)
     num_dependencies: np.ndarray  # of int
 
-    # records the output_expr that a subexpr belongs to
+    # Tracks which output expression(s) each subexpression contributes to
     # (a subexpr can be shared across multiple output exprs)
     output_expr_ids: list[set[int]]
 
+    # === Slot Type Indices (passed to DataRow for type-specific handling) ===
     img_slot_idxs: list[int]  # Indices of image slots
     media_slot_idxs: list[int]  # Indices of non-image media slots
     array_slot_idxs: list[int]  # Indices of array slots
@@ -104,11 +135,23 @@ class RowBuilder:
 
     @dataclasses.dataclass
     class EvalCtx:
-        """Context for evaluating a set of target exprs"""
+        """Context for evaluating a specific set of target expressions.
 
+        Defines the subset of the expression DAG that needs to be evaluated to produce
+        the target expressions. Used by RowBuilder.eval() and ExprEvalNode to know
+        which expressions to evaluate and in what order.
+
+        The slot_idxs list is in topological order (dependencies first), enabling
+        single-pass evaluation.
+        """
+
+        # All slot indices needed (targets + their dependencies), in evaluation order
         slot_idxs: list[int]  # slot idxs of exprs needed to evaluate target exprs; does not contain duplicates
+        # Corresponding Expr objects for slot_idxs
         exprs: list[Expr]  # exprs corresponding to slot_idxs
+        # Slot indices of the final target expressions (may have duplicates if same expr requested twice)
         target_slot_idxs: list[int]  # slot idxs of target exprs; might contain duplicates
+        # Corresponding Expr objects for target_slot_idxs
         target_exprs: list[Expr]  # exprs corresponding to target_slot_idxs
 
     def __init__(
@@ -308,9 +351,19 @@ class RowBuilder:
     T = TypeVar('T', bound=Expr)
 
     def _record_unique_expr(self, expr: T, recursive: bool) -> T:
-        """Records the expr if it's not a duplicate and assigns a slot idx to expr and its components"
+        """Register an expression in the DAG, deduplicating and assigning slot indices.
+
+        This is the core method for building the expression DAG. It ensures:
+        1. Each unique expression gets exactly one slot_idx (deduplication via ExprSet)
+        2. Dependencies are recorded before dependents (topological ordering)
+        3. All component expressions are also registered
+
+        Args:
+            expr: The expression to register.
+            recursive: If True, also recursively register all component expressions.
+
         Returns:
-            the unique expr
+            The canonical expression (may be a previously registered equivalent).
         """
         if expr in self.unique_exprs:
             # expr is a duplicate: we use the original instead
@@ -338,10 +391,19 @@ class RowBuilder:
     def _compute_dependencies(
         self, target_slot_idxs: list[int], excluded_slot_idxs: list[int], target_scope: ExprScope | None = None
     ) -> list[int]:
-        """Compute exprs needed to materialize the given target slots, excluding 'excluded_slot_idxs'
+        """Compute the transitive closure of dependencies needed to evaluate target slots.
 
-        If target_scope != None, stops transitive dependency resolution when leaving target_scope (ie, includes
-        immediate dependents that aren't in target_scope, but doesn't resolve those).
+        Traverses the expression DAG from targets back through dependencies, collecting
+        all slot indices that must be evaluated. The result is sorted for deterministic ordering.
+
+        Args:
+            target_slot_idxs: Slots we want to evaluate.
+            excluded_slot_idxs: Slots to skip (already have values, e.g., input expressions).
+            target_scope: If set, stops resolving transitive deps when leaving this scope
+                (includes immediate out-of-scope deps but doesn't resolve their deps).
+
+        Returns:
+            Sorted list of slot indices needed to evaluate targets.
         """
         dependencies: list[set[int]] = [set() for _ in range(self.num_materialized)]  # indexed by slot_idx
         # doing this front-to-back ensures that we capture transitive dependencies
@@ -446,7 +508,12 @@ class RowBuilder:
         )
 
     def set_exc(self, data_row: DataRow, slot_idx: int, exc: Exception) -> None:
-        """Record an exception in data_row and propagate it to dependents"""
+        """Record an exception in data_row and propagate it to all transitive dependents.
+
+        When an expression fails, all expressions that depend on it (directly or indirectly)
+        will also fail with the same exception. This prevents attempting to evaluate
+        expressions with missing inputs.
+        """
         data_row.set_exc(slot_idx, exc)
         for idx in self._exc_dependents[slot_idx]:
             data_row.set_exc(idx, exc)
@@ -459,13 +526,18 @@ class RowBuilder:
         ignore_errors: bool = False,
         force_eval: ExprScope | None = None,
     ) -> None:
-        """
-        Populates the slots in data_row given in ctx.
-        If an expr.eval() raises an exception, records the exception in the corresponding slot of data_row
-        and omits any of that expr's dependents's eval().
-        profile: if present, populated with execution time of each expr.eval() call; indexed by expr.slot_idx
-        ignore_errors: if False, raises ExprEvalError if any expr.eval() raises an exception
-        force_eval: forces exprs in the specified scope to be reevaluated, even if they already have a value
+        """Synchronously evaluate expressions and populate data_row slots.
+
+        This is the synchronous evaluation path, used when async evaluation isn't needed.
+        Evaluates expressions in topological order (dependencies first).
+
+        Args:
+            data_row: The row to populate with computed values.
+            ctx: Defines which expressions to evaluate.
+            profile: Optional profiler to record per-expression timing.
+            ignore_errors: If True, continue evaluating other expressions after an error.
+                If False (default), raises ExprEvalError on first error.
+            force_eval: If set, re-evaluates expressions in this scope even if they have values.
         """
         for expr in ctx.exprs:
             assert expr.slot_idx >= 0
@@ -489,11 +561,21 @@ class RowBuilder:
     def create_store_table_row(
         self, data_row: DataRow, cols_with_excs: set[int] | None, pk: tuple[int, ...]
     ) -> tuple[list[Any], int]:
-        """Create a store table row from the slots that have an output column assigned
+        """Convert a DataRow into a list of values ready for database insertion.
 
-        Return tuple[list of row values in `self.table_columns` order, # of exceptions]
-            This excludes system columns.
-            Row values are converted to their store type.
+        Extracts values from data_row slots, converts them to storage format, and
+        assembles them in the order expected by the database table.
+
+        Args:
+            data_row: The evaluated row containing computed values.
+            cols_with_excs: If provided, populated with column IDs that had exceptions.
+            pk: Primary key tuple to prepend to the row values.
+
+        Returns:
+            Tuple of (row_values, num_exceptions):
+            - row_values: List starting with pk, followed by column values in table_columns order.
+              Includes cellmd columns where applicable.
+            - num_exceptions: Count of columns that had evaluation errors.
         """
         from pixeltable.exprs.column_property_ref import ColumnPropertyRef
 
@@ -551,7 +633,11 @@ class RowBuilder:
         return store_col_names
 
     def make_row(self) -> exprs.DataRow:
-        """Creates a new DataRow with the current row_builder's configuration."""
+        """Factory method to create a new DataRow compatible with this RowBuilder.
+
+        The created row has the correct number of slots and type indices configured
+        to match this RowBuilder's expression DAG.
+        """
         return exprs.DataRow(
             size=self.num_materialized,
             img_slot_idxs=self.img_slot_idxs,

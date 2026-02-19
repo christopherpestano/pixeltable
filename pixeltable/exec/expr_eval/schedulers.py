@@ -22,7 +22,10 @@ __all__ = ['RateLimitsScheduler', 'RequestRateScheduler']
 
 class RateLimitsScheduler(Scheduler):
     """
-    Scheduler for FunctionCalls with a RateLimitsInfo pool, which provides information about actual resource usage.
+    Intelligent scheduler for API calls with dynamic rate limit tracking.
+
+    This scheduler works with APIs (like OpenAI) that provide rate limit information in response headers.
+    It tracks resource usage (tokens, requests) and waits when approaching limits.
 
     Scheduling strategy:
     - try to stay below resource limits by utilizing reported RateLimitInfo.remaining
@@ -35,15 +38,21 @@ class RateLimitsScheduler(Scheduler):
     - limit the number of in-flight requests based on the open file limit
     """
 
+    # Parameter names needed to estimate resource consumption for a request
     get_request_resources_param_names: list[str]  # names of parameters of RateLimitsInfo.get_request_resources()
 
-    # scheduling-related state
+    # === Scheduling state ===
+    # Tracks rate limits reported by the API (tokens remaining, reset times, etc.)
     pool_info: env.RateLimitsInfo | None
+    # Estimated resource consumption for in-flight requests (not yet confirmed by API)
     est_usage: dict[str, int]  # value per resource; accumulated estimates since the last util. report
 
+    # Count of requests dispatched but not yet completed
     num_in_flight: int  # unfinished tasks
+    # Signaled when a request completes (may free up rate limit capacity)
     request_completed: asyncio.Event
 
+    # Statistics for debugging
     total_requests: int
     total_retried: int
 
@@ -249,7 +258,10 @@ class RateLimitsScheduler(Scheduler):
 
 class RequestRateScheduler(Scheduler):
     """
-    Scheduler for FunctionCalls with a fixed request rate limit and no runtime resource usage reports.
+    Simple scheduler with fixed request rate limiting (requests per minute).
+
+    Used for APIs that don't provide dynamic rate limit feedback. Enforces a minimum
+    delay between requests based on configured limits.
 
     Rate limits are supplied in the config, in one of two ways:
     - resource_pool='request-rate:<endpoint>':
@@ -264,7 +276,9 @@ class RequestRateScheduler(Scheduler):
     - adaptive rate limiting based on 429 errors
     """
 
+    # Minimum seconds between consecutive requests (1/rate_limit_per_second)
     secs_per_request: float  # inverted rate limit
+    # Statistics for monitoring
     num_in_flight: int
     total_requests: int
     total_retried: int
@@ -413,5 +427,5 @@ class RequestRateScheduler(Scheduler):
             return exponential_backoff(num_retries, max_delay=self.MAX_RETRY_DELAY)
 
 
-# all concrete Scheduler subclasses that implement matches()
+# Registry of all Scheduler implementations - ExprEvalNode uses matches() to select the right one
 SCHEDULERS = [RateLimitsScheduler, RequestRateScheduler]

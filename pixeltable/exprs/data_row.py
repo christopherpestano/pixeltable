@@ -23,12 +23,17 @@ from pixeltable.utils.misc import non_none_dict_factory
 class ArrayMd:
     """
     Metadata for array cells that are stored externally.
+
+    When arrays are too large to store inline in the database, they are written to external storage.
+    This metadata tracks the byte range within the external file where the array data resides.
     """
 
+    # Byte offset where array data begins in external storage
     start: int
+    # Byte offset where array data ends in external storage
     end: int
 
-    # we store bool arrays as packed bits (uint8 arrays), and need to record the shape to reconstruct the array
+    # Boolean arrays are stored as packed bits (uint8) for efficiency; shape is needed to reconstruct
     is_bool: bool = False
     shape: tuple[int, ...] | None = None
 
@@ -42,29 +47,42 @@ class ArrayMd:
 class BinaryMd:
     """
     Metadata for binary cells that are stored externally.
+
+    Similar to ArrayMd, this tracks byte ranges for binary data stored outside the database.
     """
 
+    # Byte offset where binary data begins in external storage
     start: int
+    # Byte offset where binary data ends in external storage
     end: int
 
 
 @dataclasses.dataclass
 class CellMd:
     """
-    Content of the cellmd column.
+    Content of the cellmd column - per-cell metadata stored alongside values.
 
-    All fields are optional, to minimize storage.
+    This metadata column stores auxiliary information about a cell's value:
+    - Error information when expression evaluation fails
+    - References to external files for media/array data
+    - Byte offsets for externally stored arrays/binaries
+
+    All fields are optional to minimize storage overhead for the common case.
     """
 
+    # Exception class name when evaluation failed (e.g., "ValueError")
     errortype: str | None = None
+    # Exception message when evaluation failed
     errormsg: str | None = None
 
-    # a list of file urls that are used to store images and arrays; only set for json and array columns
-    # for json columns: a list of all urls referenced in the column value
-    # for array columns: a single url
+    # URLs referencing external files containing cell data:
+    # - For json columns: list of all media URLs embedded in the JSON structure
+    # - For array columns: single URL pointing to the serialized array file
     file_urls: list[str] | None = None
 
+    # Byte range metadata for externally stored arrays
     array_md: ArrayMd | None = None
+    # Byte range metadata for externally stored binary data
     binary_md: BinaryMd | None = None
 
     @classmethod
@@ -107,12 +125,20 @@ class DataRow:
     - DocumentType: local path if available, otherwise url
     """
 
-    # expr evaluation state; indexed by slot idx
+    # === Expression evaluation state (indexed by slot_idx) ===
+    # Each expression in the DAG is assigned a unique slot_idx; these arrays track per-slot state.
+
+    # Computed values for each expression slot
     vals: np.ndarray  # of object
+    # True if slot has been computed (may still be None if computation returned None or raised exception)
     has_val: np.ndarray  # of bool
+    # Exception objects for slots where evaluation failed
     excs: np.ndarray  # of object
+    # Boolean mask of slots that still need to be computed for this row
     missing_slots: np.ndarray  # of bool; number of missing dependencies
+    # Count of dependent slots that haven't been computed yet (used for garbage collection)
     missing_dependents: np.ndarray  # of int16; number of missing dependents
+    # Prevents duplicate scheduling: True if slot evaluation has already been queued
     is_scheduled: np.ndarray  # of bool; True if this slot is scheduled for evaluation
 
     # CellMd needed for query execution; needs to be indexed by slot idx, not column id, to work for joins
@@ -145,10 +171,15 @@ class DataRow:
     cell_vals: dict[int, Any]  # materialized values of output columns, in the format required for the column
     cell_md: dict[int, CellMd]
 
-    # control structures that are shared across all DataRows in a batch
+    # === Slot type indices (shared across all DataRows in a batch) ===
+    # These lists identify which slots contain specific data types, enabling type-specific handling.
+    # Images are loaded lazily from file_paths when accessed via __getitem__
     img_slot_idxs: list[int]
+    # Non-image media (video, audio, document) - stored as file paths/URLs
     media_slot_idxs: list[int]
+    # NumPy arrays - serialized to bytes for storage
     array_slot_idxs: list[int]
+    # JSON data - requires special NULL handling for storage
     json_slot_idxs: list[int]
 
     def __init__(
@@ -170,6 +201,11 @@ class DataRow:
         self.json_slot_idxs = json_slot_idxs
 
     def init(self, size: int) -> None:
+        """Initialize or reset all slot arrays to their default state.
+
+        Args:
+            size: Number of slots (expressions) this row needs to hold.
+        """
         self.vals = np.full(size, None, dtype=object)
         self.has_val = np.zeros(size, dtype=bool)
         self.excs = np.full(size, None, dtype=object)
@@ -187,6 +223,14 @@ class DataRow:
         self.parent_slot_idx = None
 
     def clear(self, slot_idxs: np.ndarray | None = None) -> None:
+        """Clear computed values for specified slots (garbage collection) or reset entire row.
+
+        Called during expression evaluation to free memory for intermediate results
+        that are no longer needed after their dependents have been computed.
+
+        Args:
+            slot_idxs: Boolean mask or index array of slots to clear. If None, resets entire row.
+        """
         if slot_idxs is not None:
             self.has_val[slot_idxs] = False
             self.vals[slot_idxs] = None
@@ -242,11 +286,16 @@ class DataRow:
         return self.excs[mask][0]
 
     def set_exc(self, slot_idx: int, exc: Exception) -> None:
+        """Record an exception for a slot that failed during evaluation.
+
+        The slot is marked as having a value (None) to prevent re-evaluation.
+        Exceptions propagate to dependent slots via RowBuilder.set_exc().
+        """
         assert self.excs[slot_idx] is None
         self.excs[slot_idx] = exc
         self._may_have_exc = True
 
-        # an exception means the value is None
+        # Mark as computed with None value - prevents re-evaluation attempts
         self.has_val[slot_idx] = True
         self.vals[slot_idx] = None
         self.file_paths[slot_idx] = None
@@ -304,8 +353,11 @@ class DataRow:
         return self.vals[index]
 
     def __setitem__(self, idx: int, val: Any) -> None:
-        """Assign in-memory cell value
-        This allows overwriting
+        """Assign in-memory cell value with type-specific handling.
+
+        Media values (str paths/URLs) are parsed to populate file_urls/file_paths.
+        Array values (bytes) are deserialized from NumPy format.
+        This allows overwriting existing values.
         """
         assert isinstance(idx, int)
         assert self.excs[idx] is None
@@ -383,8 +435,10 @@ class DataRow:
 
     @property
     def rowid(self) -> tuple[int, ...]:
+        """The row identifier portion of the primary key (excludes version number)."""
         return self.pk[:-1]
 
     @property
     def v_min(self) -> int:
+        """The version number from the primary key (last element)."""
         return self.pk[-1]

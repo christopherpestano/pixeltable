@@ -11,6 +11,7 @@ def _infer_schema_from_rows(
     rows: Iterable[dict[str, Any]], schema_overrides: dict[str, ts.ColumnType], primary_key: list[str]
 ) -> dict[str, ts.ColumnType]:
     schema: dict[str, ts.ColumnType] = {}
+    # Tracks columns that have at least one None value (used to detect columns with only Nones)
     cols_with_nones: set[str] = set()
 
     for n, row in enumerate(rows):
@@ -25,6 +26,7 @@ def _infer_schema_from_rows(
             elif value is not None:
                 # If `key` is not in `schema_overrides`, then we infer its type from the data.
                 # The column type will always be nullable by default.
+                # for_inference=True in supertype() below means type widening is allowed
                 col_type = ts.ColumnType.infer_literal_type(value, nullable=col_name not in primary_key)
                 if col_type is None:
                     raise excs.Error(
@@ -34,6 +36,7 @@ def _infer_schema_from_rows(
                 if col_name not in schema:
                     schema[col_name] = col_type
                 else:
+                    # Find a type that can represent both the existing type and the new value's type
                     supertype = schema[col_name].supertype(col_type, for_inference=True)
                     if supertype is None:
                         raise excs.Error(
@@ -45,6 +48,7 @@ def _infer_schema_from_rows(
             else:
                 cols_with_nones.add(col_name)
 
+    # Columns with only None values - no type can be inferred since we never saw a non-None value
     entirely_none_cols = cols_with_nones - schema.keys()
     if len(entirely_none_cols) > 0:
         # A column can only end up in `entirely_none_cols` if it was not in `schema_overrides` and

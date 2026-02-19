@@ -36,6 +36,7 @@ class DefaultExprEvaluator(Evaluator):
         self.dispatcher.register_task(task)
 
     async def eval(self, rows: list[exprs.DataRow]) -> None:
+        # Tracks which row indices hit exceptions so we can exclude them from the final dispatch
         rows_with_excs: set[int] = set()  # records idxs into rows
         for idx, row in enumerate(rows):
             assert not row.has_val[self.e.slot_idx] and not row.has_exc(self.e.slot_idx)
@@ -91,6 +92,7 @@ class FnCallEvaluator(Evaluator):
         assert self.fn_call.slot_idx >= 0
 
         # create FnCallArgs for incoming rows
+        # Rows where parameters have None values in non-nullable positions are skipped
         skip_rows: list[exprs.DataRow] = []  # skip rows with Nones in non-nullable parameters
         rows_call_args: list[FnCallArgs] = []
         for row in rows:
@@ -106,6 +108,8 @@ class FnCallEvaluator(Evaluator):
         if len(skip_rows) > 0:
             self.dispatcher.dispatch(skip_rows, self.eval_ctx)
 
+        # Batch accumulation: wait until we have enough rows to form a complete batch before execution.
+        # This improves efficiency for batched functions by reducing per-batch overhead.
         if self.batch_size is not None:
             if not self.is_closed and (len(rows_call_args) + self.call_args_queue.qsize() < self.batch_size):
                 # we don't have enough FnCallArgs for a batch, so add them to the queue
@@ -159,7 +163,10 @@ class FnCallEvaluator(Evaluator):
             yield self.call_args_queue.get_nowait()
 
     def _create_batch_call_args(self, call_args: list[FnCallArgs]) -> FnCallArgs:
-        """Roll call_args into a single batched FnCallArgs"""
+        """Transform individual function calls into a single batched call.
+
+        Converts N individual calls with args (a1, a2) into one call with batch_args ([a1_1..a1_N], [a2_1..a2_N]).
+        """
         batch_args: list[list[Any | None]] = [[None] * len(call_args) for _ in range(len(self.fn_call.arg_idxs))]
         batch_kwargs: dict[str, list[Any | None]] = {k: [None] * len(call_args) for k in self.fn_call.kwarg_idxs}
         assert isinstance(self.fn, func.CallableFunction)
@@ -246,6 +253,9 @@ class NestedRowList:
     """
     A list of nested rows, used by JsonMapperDispatcher to store the rows corresponding to the elements of the
     JsonMapper source list and make completion awaitable.
+
+    When a JsonMapper applies a transformation to each element of a list, each element gets its own DataRow.
+    This class tracks those rows and signals when all have completed evaluation.
     """
 
     rows: list[exprs.DataRow]
@@ -336,7 +346,11 @@ class JsonMapperDispatcher(Evaluator):
         self.dispatcher.register_task(task)
 
     async def gather(self, rows: list[exprs.DataRow]) -> None:
-        """Wait for nested rows to complete, then signal completion to the parent rows"""
+        """Wait for nested rows to complete, then signal completion to the parent rows.
+
+        Dispatch strategy: async calls complete out-of-order, so we dispatch as each completes.
+        Sync calls complete in-order, so we can wait for all and dispatch together.
+        """
         if self.has_async_calls:
             # if our target expr contains async FunctionCalls, they typically get completed out-of-order, and it's
             # more effective to dispatch them as they complete

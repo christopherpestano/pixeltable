@@ -42,12 +42,14 @@ class ExprEvalNode(ExecNode):
       of which only contains a subset of the models which is known to fit onto the gpu simultaneously
     """
 
+    # Controls whether output order matches input order (True) or allows out-of-order completion (False)
     maintain_input_order: bool  # True if we're returning rows in the order we received them from our input
     outputs: np.ndarray  # bool per slot; True if this slot is part of our output
     schedulers: dict[str, Scheduler]  # key: resource pool name
     eval_ctx: ExprEvalCtx  # for input/output rows
 
     # execution state
+    # Holds references to running tasks to prevent garbage collection before completion
     tasks: set[asyncio.Task]  # collects all running tasks to prevent them from getting gc'd
     exc_event: asyncio.Event  # set if an exception needs to be propagated
     error: Exception | None  # exception that needs to be propagated
@@ -57,8 +59,9 @@ class ExprEvalNode(ExecNode):
     current_input_batch: DataRowBatch | None  # batch from which we're currently consuming rows
     input_row_idx: int  # next row to consume from current_input_batch
     next_input_batch: DataRowBatch | None  # read-ahead input batch
-    avail_input_rows: int  # total number across both current_/next_input_batch
+    available_input_rows: int  # total number across both current_/next_input_batch
     input_complete: bool  # True if we've received all input batches
+    # Counts rows that have been dispatched for evaluation but not yet completed
     num_in_flight: int  # number of dispatched rows that haven't completed
     row_pos_map: dict[int, int] | None  # id(row) -> position of row in input; only set if maintain_input_order
     output_buffer: RowBuffer  # holds rows that are ready to be returned, in order
@@ -69,6 +72,7 @@ class ExprEvalNode(ExecNode):
     num_output_rows: int
 
     BATCH_SIZE = 64
+    # Limits memory usage by capping rows in flight (dispatched but not yet returned to caller)
     MAX_BUFFERED_ROWS = 2048  # maximum number of rows that have been dispatched but not yet returned
 
     def __init__(
@@ -91,7 +95,7 @@ class ExprEvalNode(ExecNode):
         self.current_input_batch = None
         self.next_input_batch = None
         self.input_row_idx = 0
-        self.avail_input_rows = 0
+        self.available_input_rows = 0
         self.input_complete = False
         self.num_in_flight = 0
         self.row_pos_map = None
@@ -134,14 +138,14 @@ class ExprEvalNode(ExecNode):
                 for idx, row in enumerate(batch.rows):
                     self.row_pos_map[id(row)] = self.num_input_rows + idx
             self.num_input_rows += len(batch)
-            self.avail_input_rows += len(batch)
+            self.available_input_rows += len(batch)
             _logger.debug(
                 f'adding input: batch_size={len(batch)} #input_rows={self.num_input_rows} '
-                f'#avail={self.avail_input_rows}'
+                f'#avail={self.available_input_rows}'
             )
         except StopAsyncIteration:
             self.input_complete = True
-            _logger.debug(f'finished input: #input_rows={self.num_input_rows}, #avail={self.avail_input_rows}')
+            _logger.debug(f'finished input: #input_rows={self.num_input_rows}, #avail={self.available_input_rows}')
         # make sure to pass DBAPIError through, so the transaction handling logic sees it
         except Exception as exc:
             self.error = exc
@@ -153,17 +157,17 @@ class ExprEvalNode(ExecNode):
 
     def _dispatch_input_rows(self) -> None:
         """Dispatch the maximum number of input rows, given total_buffered; does not block"""
-        if self.avail_input_rows == 0:
+        if self.available_input_rows == 0:
             return
-        num_rows = min(self.MAX_BUFFERED_ROWS - self.total_buffered, self.avail_input_rows)
+        num_rows = min(self.MAX_BUFFERED_ROWS - self.total_buffered, self.available_input_rows)
         assert num_rows >= 0
         if num_rows == 0:
             return
         assert self.current_input_batch is not None
-        avail_current_batch_rows = len(self.current_input_batch) - self.input_row_idx
+        available_in_current_batch = len(self.current_input_batch) - self.input_row_idx
 
         rows: list[exprs.DataRow]
-        if avail_current_batch_rows > num_rows:
+        if available_in_current_batch > num_rows:
             # we only need rows from current_input_batch
             rows = self.current_input_batch.rows[self.input_row_idx : self.input_row_idx + num_rows]
             self.input_row_idx += num_rows
@@ -177,7 +181,7 @@ class ExprEvalNode(ExecNode):
             if num_remaining > 0:
                 rows.extend(self.current_input_batch.rows[:num_remaining])
                 self.input_row_idx = num_remaining
-        self.avail_input_rows -= num_rows
+        self.available_input_rows -= num_rows
         self.num_in_flight += num_rows
         self._log_state(f'dispatch input ({num_rows})')
 
@@ -188,7 +192,7 @@ class ExprEvalNode(ExecNode):
         _logger.debug(
             f'{prefix}: #in-flight={self.num_in_flight} #complete={self.completed_rows.qsize()} '
             f'#output-buffer={self.output_buffer.num_rows} #ready={self.output_buffer.num_ready} '
-            f'total-buffered={self.total_buffered} #avail={self.avail_input_rows} '
+            f'total-buffered={self.total_buffered} #avail={self.available_input_rows} '
             f'#input={self.num_input_rows} #output={self.num_output_rows}'
         )
 
@@ -225,15 +229,16 @@ class ExprEvalNode(ExecNode):
             self.output_buffer.set_row_pos_map(self.row_pos_map)
 
         row: exprs.DataRow
-        exc_event_aw = asyncio.create_task(self.exc_event.wait(), name='exc_event.wait()')
-        input_batch_aw: asyncio.Task | None = None
-        completed_aw: asyncio.Task | None = None
+        exc_wait_task = asyncio.create_task(self.exc_event.wait(), name='exc_event.wait()')
+        fetch_input_task: asyncio.Task | None = None
+        completion_wait_task: asyncio.Task | None = None
         closed_evaluators = False  # True after calling Evaluator.close()
         exprs.Expr.prepare_list(self.eval_ctx.all_exprs)
 
+        # === MAIN EVENT LOOP - processes rows through expression evaluation pipeline ===
         try:
             while True:
-                # process completed rows before doing anything else
+                # STEP 1: Process completed rows - move them from completion queue to output buffer
                 while not self.completed_rows.empty():
                     # move completed rows to output buffer
                     while not self.completed_rows.empty():
@@ -253,11 +258,12 @@ class ExprEvalNode(ExecNode):
                         yield DataRowBatch(row_builder=self.row_builder, rows=batch_rows)
                         # at this point, we may have more completed rows
 
+                # STEP 2: Check termination conditions
                 assert self.completed_rows.empty()  # all completed rows should be sitting in output_buffer
                 self.completed_event.clear()
                 if self.input_complete and self.num_in_flight == 0:
                     # there is no more input and nothing left to wait for
-                    assert self.avail_input_rows == 0
+                    assert self.available_input_rows == 0
                     if self.output_buffer.num_ready > 0:
                         assert self.output_buffer.num_rows == self.output_buffer.num_ready
                         # yield the leftover rows
@@ -269,26 +275,28 @@ class ExprEvalNode(ExecNode):
                     assert self.output_buffer.num_rows == 0
                     return
 
-                if self.input_complete and self.avail_input_rows == 0 and not closed_evaluators:
+                # STEP 3: Close evaluators if no more input (flush any queued batches)
+                if self.input_complete and self.available_input_rows == 0 and not closed_evaluators:
                     # no more input rows to dispatch, but we're still waiting for rows to finish:
-                    # close  all slot evaluators to flush queued rows
+                    # close all slot evaluators to flush queued rows
                     for evaluator in self.eval_ctx.slot_evaluators.values():
                         evaluator.close()
                     closed_evaluators = True
 
+                # STEP 4: Wait for next event (input batch, completion, or error)
                 # we don't have a full batch of rows at this point and need to wait
-                aws = {exc_event_aw}  # always wait for an exception
+                pending_tasks = {exc_wait_task}  # always wait for an exception
                 if self.next_input_batch is None and not self.input_complete:
                     # also wait for another batch if we don't have a read-ahead batch yet
-                    if input_batch_aw is None:
-                        input_batch_aw = asyncio.create_task(self._fetch_input_batch(), name='_fetch_input_batch()')
-                    aws.add(input_batch_aw)
+                    if fetch_input_task is None:
+                        fetch_input_task = asyncio.create_task(self._fetch_input_batch(), name='_fetch_input_batch()')
+                    pending_tasks.add(fetch_input_task)
                 if self.num_in_flight > 0:
                     # also wait for more rows to complete
-                    if completed_aw is None:
-                        completed_aw = asyncio.create_task(self.completed_event.wait(), name='completed.wait()')
-                    aws.add(completed_aw)
-                done, _ = await asyncio.wait(aws, return_when=asyncio.FIRST_COMPLETED)
+                    if completion_wait_task is None:
+                        completion_wait_task = asyncio.create_task(self.completed_event.wait(), name='completed.wait()')
+                    pending_tasks.add(completion_wait_task)
+                done, _ = await asyncio.wait(pending_tasks, return_when=asyncio.FIRST_COMPLETED)
 
                 if self.exc_event.is_set():
                     # we got an exception that we need to propagate through __iter__()
@@ -296,20 +304,20 @@ class ExprEvalNode(ExecNode):
                         raise self.error from self.error.exc
                     else:
                         raise self.error
-                if completed_aw in done:
-                    self._log_state('completed_aw done')
-                    completed_aw = None
-                if input_batch_aw in done:
+                if completion_wait_task in done:
+                    self._log_state('completion_wait_task done')
+                    completion_wait_task = None
+                if fetch_input_task in done:
                     self._dispatch_input_rows()
-                    input_batch_aw = None
+                    fetch_input_task = None
 
         finally:
             # task cleanup
-            active_tasks = {exc_event_aw}
-            if input_batch_aw is not None:
-                active_tasks.add(input_batch_aw)
-            if completed_aw is not None:
-                active_tasks.add(completed_aw)
+            active_tasks = {exc_wait_task}
+            if fetch_input_task is not None:
+                active_tasks.add(fetch_input_task)
+            if completion_wait_task is not None:
+                active_tasks.add(completion_wait_task)
             active_tasks.update(self.tasks)
             for task in active_tasks:
                 if not task.done():
@@ -348,7 +356,8 @@ class ExprEvalNode(ExecNode):
         if len(rows) == 0 or self.exc_event.is_set():
             return
 
-        # slots ready for evaluation; rows x slots
+        # Slots ready for evaluation: a slot is ready when all its dependencies have values
+        # Matrix shape: rows x slots, True indicates the slot is ready for that row
         ready_slots = np.zeros((len(rows), exec_ctx.row_builder.num_materialized), dtype=bool)
         completed_rows = np.zeros(len(rows), dtype=bool)
         num_computed_outputs = 0
@@ -378,7 +387,9 @@ class ExprEvalNode(ExecNode):
                 ready_slots[i] = (num_missing == 0) & (row.is_scheduled == False) & row.missing_slots
                 row.is_scheduled |= ready_slots[i]
 
-            # clear intermediate values that are no longer needed (ie, all dependents are materialized)
+            # Garbage collection: clear intermediate values when all their dependents have been computed.
+            # A slot can be cleared when: (1) no more slots depend on it (missing_dependents == 0),
+            # (2) it previously had dependents (row.missing_dependents > 0), and (3) it's not an output slot
             missing_dependents = np.sum(exec_ctx.row_builder.dependencies[row.has_val == False], axis=0)
             gc_targets = (missing_dependents == 0) & (row.missing_dependents > 0) & exec_ctx.gc_targets
             row.clear(gc_targets)

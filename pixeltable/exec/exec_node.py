@@ -18,13 +18,31 @@ _logger = logging.getLogger('pixeltable')
 
 class ExecNode(abc.ABC):
     """
-    Base class of all execution nodes
+    Base class of all execution nodes in the query execution pipeline.
+
+    ExecNode forms a tree structure where each node:
+    - Receives DataRowBatch objects from its input node (if any)
+    - Processes or transforms the rows
+    - Yields DataRowBatch objects to its parent node
+
+    The pipeline is executed lazily via async iteration (__aiter__). Nodes include:
+    - SqlScanNode: Reads rows from database
+    - ExprEvalNode: Evaluates computed columns and expressions
+    - CachePrefetchNode: Pre-fetches media files from remote storage
+    - AggregationNode: Computes aggregates (sum, count, etc.)
+
+    Lifecycle: set_ctx() -> __enter__() -> __aiter__() -> __exit__()
     """
 
+    # Expressions this node needs to produce in its output
     output_exprs: Iterable[exprs.Expr]
+    # Shared expression DAG metadata and DataRow factory
     row_builder: exprs.RowBuilder
+    # Upstream node that feeds rows into this node (None for source nodes)
     input: ExecNode | None
+    # Image slots that need to be flushed after use (not part of final output, but needed for computation)
     flushed_img_slots: list[int]  # idxs of image slots of our output_exprs dependencies
+    # Execution context with progress reporting and error handling config
     ctx: ExecContext | None
 
     def __init__(
@@ -56,6 +74,10 @@ class ExecNode(abc.ABC):
         pass
 
     def __iter__(self) -> Iterator[DataRowBatch]:
+        """Synchronous iteration wrapper that runs the async iterator on the event loop.
+
+        Allows ExecNode to be used in regular for loops when async context isn't available.
+        """
         loop = Env.get().event_loop
         aiter = self.__aiter__()
         try:
@@ -104,6 +126,7 @@ class ExecNode(abc.ABC):
     T = TypeVar('T', bound='ExecNode')
 
     def get_node(self, node_class: type[T]) -> T | None:
+        """Find the first node of a specific type in the pipeline, searching from this node downward."""
         if isinstance(self, node_class):
             return self
         if self.input is not None:

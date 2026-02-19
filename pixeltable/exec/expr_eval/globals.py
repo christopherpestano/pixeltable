@@ -146,8 +146,11 @@ class ExprEvalCtx:
 
     row_builder: exprs.RowBuilder
     slot_evaluators: dict[int, Evaluator]  # key: slot idx
+    # Marks slots eligible for garbage collection after their dependents are computed (intermediate results)
     gc_targets: np.ndarray  # bool per slot; True if this is an intermediate expr (ie, not part of our output)
+    # Boolean mask of slots that need evaluation (excludes literals and input values which are pre-populated)
     eval_ctx: np.ndarray  # bool per slot; EvalCtx.slot_idxs as a mask
+    # Constant values to pre-populate into rows before evaluation begins
     literals: dict[int, Any]  # key: slot idx; value: literal value for this slot; used to pre-populate rows
     all_exprs: list[exprs.Expr]  # all evaluated exprs; needed for cleanup
 
@@ -196,5 +199,6 @@ class ExprEvalCtx:
             # set literals before missing_dependents/slots
             for slot_idx, val in self.literals.items():
                 row[slot_idx] = val
+            # Compute remaining dependencies: sum dependency counts only for slots that haven't been computed yet
             row.missing_dependents = np.sum(self.row_builder.dependencies[row.has_val == False], axis=0)
             row.missing_slots = self.eval_ctx & (row.has_val == False)
