@@ -67,36 +67,69 @@ def print_order_by_clause(clause: OrderByClause) -> str:
 
 class SqlNode(ExecNode):
     """
-    Materializes data from the store via a SQL statement.
-    This only provides the select list. The subclasses are responsible for the From clause and any additional clauses.
-    The pk columns are not included in the select list.
-    If set_pk is True, they are added to the end of the result set when creating the SQL statement
-    so they can always be referenced as cols[-num_pk_cols:] in the result set.
-    The pk_columns consist of the rowid columns of the target table followed by the version number.
+    Base class for execution nodes that materialize data via SQL queries.
 
-    If row_builder contains references to unstored iter columns, expands the select list to include their
-    SQL-materializable subexpressions.
+    SqlNode is the primary interface between Pixeltable's execution engine and the
+    underlying PostgreSQL database. It generates SQL SELECT statements and converts
+    database results into DataRow objects.
 
-    Args:
-        select_list: output of the query
-        set_pk: if True, sets the primary for each DataRow
+    Architecture:
+        SqlNode handles the "SQL-materializable" portion of query execution:
+        - Column values that can be fetched directly from the database
+        - Expressions that PostgreSQL can compute (arithmetic, string ops, etc.)
+        - WHERE clause predicates that can be pushed to SQL
+
+        Expressions that can't be computed in SQL (UDFs, Python functions) are
+        handled by downstream ExprEvalNode.
+
+    Subclasses:
+        - SqlScanNode: Single table SELECT with WHERE, ORDER BY, LIMIT
+        - SqlJoinNode: Multi-table SELECT with JOINs
+        - SqlAggregationNode: SELECT with GROUP BY aggregation
+        - SqlSampleNode: Random sampling queries
+
+    Data Flow:
+        1. _create_stmt() builds the SQL SELECT statement
+        2. __aiter__() executes the query and yields DataRowBatch objects
+        3. _populate_row() converts SQL result rows into DataRow objects
+
+    Key Features:
+        - Primary key retrieval (set_pk=True) for row identification
+        - Python post-filtering (py_filter) for non-SQL predicates
+        - CTE generation (to_cte()) for use in subqueries
+        - Progress reporting during long-running queries
     """
 
+    # === Configuration ===
+    # Target table (None for joins)
     tbl: catalog.TableVersionPath | None
+    # Expressions to fetch via SQL SELECT
     select_list: exprs.ExprSet
+    # Columns to populate in DataRow.cell_vals/cell_md
     columns: list[catalog.Column]  # for which columns to populate DataRow.cell_vals/cell_md
+    # Column properties that need cellmd loaded for evaluation
     cell_md_refs: list[exprs.ColumnPropertyRef]  # of ColumnRefs which also need DataRow.slot_cellmd for evaluation
+    # Whether to retrieve and set primary key on each DataRow
     set_pk: bool
+    # Number of primary key columns (rowid columns + version)
     num_pk_cols: int
+    # Python-only filter predicate (evaluated after SQL results)
     py_filter: exprs.Expr | None  # a predicate that can only be run in Python
+    # Evaluation context for py_filter
     py_filter_eval_ctx: exprs.RowBuilder.EvalCtx | None
+    # Cached CTE representation for subquery use
     cte: sql.CTE | None
+    # Cache determining which expressions are SQL-materializable
     sql_elements: exprs.SqlElementCache
+    # Progress reporting for long queries
     progress_reporter: ProgressReporter | None
 
-    # execution state
+    # === Execution State ===
+    # Final SQL select list after expansion
     sql_select_list_exprs: exprs.ExprSet
+    # Maps cellmd expressions to their index in SQL select list
     cellmd_item_idxs: exprs.ExprDict[int]  # cellmd expr -> idx in sql select list
+    # Maps columns to their index in SQL select list
     column_item_idxs: dict[catalog.Column, int]  # column -> idx in sql select list
     column_cellmd_item_idxs: dict[catalog.Column, int]  # column -> idx in sql select list
     result_cursor: sql.engine.CursorResult | None
@@ -484,16 +517,33 @@ class SqlNode(ExecNode):
 
 class SqlScanNode(SqlNode):
     """
-    Materializes data from the store via a Select stmt.
+    Fetches rows from a single table via SQL SELECT.
 
-    Supports filtering and ordering.
+    SqlScanNode is the most common source node in execution plans. It generates
+    SQL SELECT statements that can include:
+    - Column selections and expressions
+    - WHERE clause filtering (pushed from Analyzer.sql_where_clause)
+    - ORDER BY sorting
+    - LIMIT/OFFSET pagination
+
+    The FROM clause is constructed to include all necessary table joins for
+    the selected expressions (e.g., joining to base tables for view columns).
+
+    Example SQL generated:
+        SELECT col_a, col_b, col_a + col_b AS expr_0
+        FROM my_table t
+        WHERE t.col_a > 5
+        ORDER BY t.col_a
+        LIMIT 100
 
     Args:
-        select_list: output of the query
-        set_pk: if True, sets the primary for each DataRow
-        exact_version_only: tables for which we only want to see rows created at the current version
+        tbl: Table to scan
+        select_list: Expressions to materialize
+        set_pk: Whether to retrieve primary key columns
+        exact_version_only: Tables for which to only see rows at current version
     """
 
+    # Tables that should only return rows from the exact current version
     exact_version_only: list[catalog.TableVersionHandle]
 
     def __init__(
@@ -574,15 +624,29 @@ class SqlLookupNode(SqlNode):
 
 class SqlAggregationNode(SqlNode):
     """
-    Materializes data from the store via a Select stmt with a WHERE clause that matches a list of key values
+    Performs GROUP BY aggregation in SQL.
+
+    Used when all aggregation expressions (sum, count, avg, etc.) can be computed
+    by PostgreSQL. Takes a SqlNode as input (via CTE) and adds GROUP BY clause.
+
+    When SQL aggregation isn't possible (e.g., custom Python aggregates),
+    the Planner uses AggregationNode instead.
+
+    Example SQL generated:
+        WITH input_cte AS (SELECT ... FROM ...)
+        SELECT group_col, SUM(value_col), COUNT(*)
+        FROM input_cte
+        GROUP BY group_col
 
     Args:
-        select_list: can contain calls to AggregateFunctions
-        group_by_items: list of expressions to group by
-        limit: max number of rows to return: None = no limit
+        input: Source SqlNode (converted to CTE)
+        select_list: Expressions including aggregate function calls
+        group_by_items: Expressions to group by (None for single-group aggregation)
     """
 
+    # GROUP BY expressions (None = single group for entire result)
     group_by_items: list[exprs.Expr] | None
+    # Input query as CTE
     input_cte: sql.CTE | None
 
     def __init__(
@@ -611,10 +675,34 @@ class SqlAggregationNode(SqlNode):
 
 class SqlJoinNode(SqlNode):
     """
-    Materializes data from the store via a Select ... From ... that contains joins
+    Joins multiple tables via SQL JOIN clauses.
+
+    Takes multiple SqlScanNode inputs (one per table) and combines them using
+    SQL JOIN operations. Each input is converted to a CTE, then joined according
+    to the join_clauses specification.
+
+    Supports:
+    - INNER JOIN
+    - LEFT OUTER JOIN
+    - FULL OUTER JOIN
+    - CROSS JOIN
+
+    Example SQL generated:
+        WITH cte0 AS (SELECT ... FROM table1),
+             cte1 AS (SELECT ... FROM table2)
+        SELECT cte0.col_a, cte1.col_b
+        FROM cte0
+        JOIN cte1 ON cte0.id = cte1.foreign_id
+
+    Args:
+        inputs: List of SqlScanNode objects, one per table
+        join_clauses: Join specifications (type and predicate) for each join
+        select_list: Expressions to return from the joined result
     """
 
+    # Input queries converted to CTEs
     input_ctes: list[sql.CTE]
+    # Join specifications (join_clauses[i] joins inputs[i] with inputs[i+1])
     join_clauses: list['pixeltable.plan.JoinClause']
 
     def __init__(

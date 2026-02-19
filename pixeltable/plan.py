@@ -155,28 +155,62 @@ class SampleClause:
 
 class Analyzer:
     """
-    Performs semantic analysis of a query and stores the analysis state.
+    Performs semantic analysis of a query and prepares it for execution planning.
+
+    The Analyzer is the first stage of query processing. It takes a raw query specification
+    and performs several critical transformations:
+
+    1. **Expression Resolution**: Resolves computed column references to their value expressions
+    2. **WHERE Clause Splitting**: Separates WHERE predicates into:
+       - sql_where_clause: Predicates that can be pushed down to SQL
+       - filter: Predicates that must be evaluated in Python
+    3. **Aggregation Analysis**: Identifies aggregate and window function calls,
+       validates GROUP BY semantics
+    4. **Expression Collection**: Builds all_exprs - the complete list of expressions
+       that need to be evaluated
+
+    The Analyzer works with SqlElementCache to determine which expressions are
+    SQL-materializable (can be computed in the database) vs which require Python evaluation.
+
+    Lifecycle:
+        1. __init__(): Parses and normalizes query components
+        2. finalize(): Called after RowBuilder is created to complete analysis
+        3. Results used by Planner to construct execution tree
     """
 
+    # === Query Structure ===
     from_clause: FromClause
+    # All expressions that will be evaluated in Python (excludes sql_where_clause)
     all_exprs: list[exprs.Expr]  # union of all exprs, aside from sql_where_clause
+    # SELECT list expressions (what the query returns)
     select_list: list[exprs.Expr]
+    # GROUP BY expressions (None = no aggregation, [] = single-group aggregation)
     group_by_clause: list[exprs.Expr] | None  # None for non-aggregate queries; [] for agg query w/o grouping
+    # Expressions used for grouping (resolved from group_by_clause)
     grouping_exprs: list[exprs.Expr]  # [] for non-aggregate queries or agg query w/o grouping
+    # ORDER BY specifications
     order_by_clause: OrderByClause
-    stratify_exprs: list[exprs.Expr]  # [] if no stratiifcation is required
+    # SAMPLE STRATIFY expressions
+    stratify_exprs: list[exprs.Expr]  # [] if no stratification is required
+    # SAMPLE clause configuration
     sample_clause: SampleClause | None  # None if no sampling clause is present
 
+    # === SQL Optimization ===
+    # Cache that determines which expressions can be computed in SQL
     sql_elements: exprs.SqlElementCache
 
-    # Where clause of the Select stmt of the SQL scan
+    # WHERE clause portion that can be pushed to SQL (executed in database)
     sql_where_clause: exprs.Expr | None
 
-    # filter predicate applied to output rows of the SQL scan
+    # WHERE clause portion that must be evaluated in Python (post-SQL filter)
     filter: exprs.Expr | None
 
+    # === Aggregation State ===
+    # Grouping aggregate function calls (e.g., sum(), count())
     agg_fn_calls: list[exprs.FunctionCall]  # grouping aggregation (ie, not window functions)
+    # Window function calls (e.g., row_number(), lag())
     window_fn_calls: list[exprs.FunctionCall]
+    # ORDER BY expressions required for aggregation
     agg_order_by: list[exprs.Expr]
 
     def __init__(
@@ -345,6 +379,42 @@ class Analyzer:
 
 
 class Planner:
+    """
+    Builds execution plans (ExecNode trees) from analyzed queries.
+
+    The Planner is the core of query compilation. It takes an Analyzer's output and
+    constructs a tree of ExecNode objects that, when iterated, produce query results.
+
+    Execution Plan Structure:
+        A typical query plan looks like:
+
+        ```
+        SqlScanNode          # Fetch data from database
+            ↓
+        CachePrefetchNode    # Pre-fetch media files (optional)
+            ↓
+        ExprEvalNode         # Evaluate Python expressions (UDFs, computed columns)
+            ↓
+        AggregationNode      # Compute aggregates (if GROUP BY present)
+            ↓
+        [Output]             # DataRowBatch objects yielded to caller
+        ```
+
+    Key Planning Decisions:
+        1. **SQL vs Python**: Determines which expressions run in SQL (SqlScanNode)
+           vs which need Python evaluation (ExprEvalNode)
+        2. **Aggregation Strategy**: SQL aggregation (SqlAggregationNode) vs
+           Python aggregation (AggregationNode)
+        3. **Order Maintenance**: Whether ExprEvalNode needs to preserve input order
+        4. **Prefetching**: Whether media files need pre-fetching from remote storage
+
+    Main Entry Points:
+        - create_query_plan(): For SELECT queries
+        - create_insert_plan(): For INSERT operations
+        - create_add_column_plan(): For adding computed columns
+        - create_update_plan(): For UPDATE operations
+    """
+
     @classmethod
     def create_count_stmt(cls, query: 'pxt.Query') -> sql.Select:
         """Creates a SQL SELECT COUNT(*) statement for counting rows in a Query."""
@@ -921,14 +991,33 @@ class Planner:
         exact_version_only: list[catalog.TableVersionHandle] | None = None,
     ) -> exec.ExecNode:
         """
-        Return plan for executing a query.
+        Main entry point for creating a SELECT query execution plan.
 
-        The plan:
-        - materializes the values of select_list exprs into their respective slots
-        - materializes cell values of 'columns' (and their cellmd, if applicable) into DataRow.cell_vals/cell_md
+        This method orchestrates the full planning process:
+        1. Creates an Analyzer to perform semantic analysis
+        2. Builds a RowBuilder to manage the expression DAG
+        3. Finalizes analysis with the RowBuilder
+        4. Calls _create_query_plan() to construct the ExecNode tree
 
-        Updates 'select_list' in place to make it executable.
-        TODO: make exact_version_only a flag and use the versions from tbl
+        Args:
+            from_clause: Tables and joins for the FROM clause
+            select_list: Expressions to return (SELECT list)
+            columns: Columns to populate in DataRow.cell_vals
+            where_clause: Filter predicate (will be split into SQL and Python parts)
+            group_by_clause: GROUP BY expressions
+            order_by_clause: ORDER BY specifications as (expr, ascending) pairs
+            limit: Maximum rows to return
+            offset: Rows to skip before returning
+            sample_clause: Random sampling configuration
+            ignore_errors: If True, continue on expression evaluation errors
+            exact_version_only: Restrict to specific table versions
+
+        Returns:
+            Root ExecNode of the execution plan tree.
+
+        Note:
+            Updates 'select_list' in place to make expressions executable
+            (assigns slot indices from the RowBuilder).
         """
         if select_list is None:
             select_list = []
@@ -985,12 +1074,46 @@ class Planner:
         exact_version_only: list[catalog.TableVersionHandle] | None = None,
     ) -> exec.ExecNode:
         """
-        Create plan to materialize eval_ctx.
+        Core planning logic that constructs the ExecNode execution tree.
+
+        This method builds the execution plan in phases:
+
+        Phase 1 - SQL Table Scans:
+            Creates SqlScanNode(s) to fetch SQL-materializable expressions from
+            the database. If joins are present, creates SqlJoinNode.
+
+        Phase 2 - Filtering and Preprocessing:
+            - Pushes sql_where_clause to SQL (WHERE in SELECT)
+            - Sets py_filter for Python-only predicates
+            - Adds CachePrefetchNode for media file prefetching
+            - Adds CellReconstructionNode for iterator columns
+
+        Phase 3 - Aggregation (if GROUP BY):
+            - Adds ExprEvalNode to compute aggregation inputs if needed
+            - Creates SqlAggregationNode (if SQL can handle it) or AggregationNode
+            - Adds final ExprEvalNode for post-aggregation expressions
+
+        Phase 4 - Final Expression Evaluation (non-aggregate):
+            - Adds ExprEvalNode if outputs aren't fully SQL-materializable
+            - This is where UDFs and computed columns are evaluated
+
+        Phase 5 - Ordering and Limits:
+            - Sets ORDER BY on the appropriate SqlNode
+            - Optimizes ExprEvalNode to not maintain order if not needed
+            - Applies LIMIT and OFFSET
 
         Args:
-            plan_target: if not None, generate a plan that materializes only expression that can be evaluted
-                in the context of that table version (eg, if 'tbl' is a view, 'plan_target' might be the base)
-        TODO: make exact_version_only a flag and use the versions from tbl
+            row_builder: Expression DAG manager with slot assignments
+            analyzer: Completed semantic analysis
+            eval_ctx: Defines which expressions to evaluate
+            columns: Columns to populate in cell_vals
+            limit: LIMIT value
+            offset: OFFSET value
+            with_pk: Whether to retrieve primary keys
+            exact_version_only: Restrict to specific table versions
+
+        Returns:
+            Root ExecNode with execution context set.
         """
         if columns is None:
             columns = []

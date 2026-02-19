@@ -32,9 +32,33 @@ _logger = logging.getLogger('pixeltable')
 
 
 class ResultSet:
+    """Container for query results returned by Query.collect().
+
+    ResultSet holds the rows returned from query execution and provides
+    convenient methods for accessing and converting the data.
+
+    The data flow that produces a ResultSet:
+        1. Query.collect() calls _output_row_iterator()
+        2. _output_row_iterator() creates and iterates the execution plan
+        3. Each DataRow's select list values are extracted
+        4. All rows are collected into this ResultSet
+
+    Attributes:
+        schema: Mapping of column names to their ColumnType
+
+    Example:
+        >>> result = t.select(t.col_a, t.col_b).collect()
+        >>> df = result.to_pandas()  # Convert to DataFrame
+        >>> len(result)  # Number of rows
+    """
+
+    # Raw row data as list of value lists
     _rows: list[list[Any]]
+    # Column names in order
     _col_names: list[str]
+    # Schema mapping column names to types
     __schema: dict[str, ColumnType]
+    # Formatter for display rendering
     __formatter: Formatter
 
     def __init__(self, rows: list[list[Any]], schema: dict[str, ColumnType]):
@@ -174,18 +198,47 @@ class ResultSet:
 
 
 class Query:
-    """Represents a query for retrieving and transforming data from Pixeltable tables."""
+    """Represents a query for retrieving and transforming data from Pixeltable tables.
 
+    Query objects are created by Table.select() and can be chained with filtering,
+    ordering, grouping, and limiting operations. The query is not executed until
+    collect() or a similar terminal method is called.
+
+    Execution Pipeline:
+        1. Query.collect() calls _create_query_plan() to build an execution tree
+        2. Planner.create_query_plan() analyzes the query and builds ExecNodes
+        3. The ExecNode tree is iterated, yielding DataRowBatch objects
+        4. Results are collected into a ResultSet
+
+    Example:
+        >>> t = pxt.get_table('my_table')
+        >>> result = t.select(t.col_a, t.col_b).where(t.col_a > 5).collect()
+
+    The Query object is immutable - each operation returns a new Query instance.
+    """
+
+    # === Query Structure ===
+    # FROM clause containing tables and join specifications
     _from_clause: plan.FromClause
+    # Expressions to compute and return (SELECT list)
     _select_list_exprs: list[exprs.Expr]
+    # Output schema mapping column names to types
     _schema: dict[str, ts.ColumnType]
+    # Original select list with optional column names
     select_list: list[tuple[exprs.Expr, str | None]] | None
+    # WHERE clause predicate (None if no filtering)
     where_clause: exprs.Expr | None
+    # GROUP BY expressions (None for non-aggregate queries)
     group_by_clause: list[exprs.Expr] | None
+    # Alternative to group_by_clause: group by table's rowid
     grouping_tbl: catalog.TableVersion | None
+    # ORDER BY specifications: (expr, ascending) pairs
     order_by_clause: list[tuple[exprs.Expr, bool]] | None
+    # LIMIT value (None for no limit)
     limit_val: exprs.Expr | None
+    # OFFSET value (None for no offset)
     offset_val: exprs.Expr | None
+    # SAMPLE clause for random sampling
     sample_clause: SampleClause | None
 
     def __init__(
@@ -352,6 +405,17 @@ class Query:
                     yield row
 
     def _create_query_plan(self) -> exec.ExecNode:
+        """Build the execution plan tree for this query.
+
+        This is the bridge between the Query representation and the execution engine.
+        It delegates to Planner.create_query_plan() which:
+        1. Creates an Analyzer to perform semantic analysis
+        2. Builds a RowBuilder to manage the expression DAG
+        3. Constructs an ExecNode tree (SqlScanNode → ExprEvalNode → ...)
+
+        Returns:
+            The root ExecNode of the execution tree.
+        """
         # construct a group-by clause if we're grouping by a table
         group_by_clause: list[exprs.Expr] | None = None
         if self.grouping_tbl is not None:
@@ -529,6 +593,17 @@ class Query:
         raise excs.Error(msg) from e
 
     def _output_row_iterator(self) -> Iterator[list]:
+        """Execute the query and yield result rows.
+
+        This method:
+        1. Creates the execution plan via _create_query_plan()
+        2. Iterates through the plan, receiving DataRowBatch objects
+        3. Extracts select list values from each DataRow
+        4. Yields rows as lists of values
+
+        Yields:
+            Lists of values corresponding to the select list expressions.
+        """
         # TODO: extend begin_xact() to accept multiple TVPs for joins
         single_tbl = self._first_tbl if len(self._from_clause.tbls) == 1 else None
         with Catalog.get().begin_xact(tbl=single_tbl, for_write=False):
@@ -542,6 +617,16 @@ class Query:
                 raise  # just re-raise if not converted to a Pixeltable error
 
     def collect(self) -> ResultSet:
+        """Execute the query and return all results as a ResultSet.
+
+        This is the primary method for executing a query. It:
+        1. Builds the execution plan
+        2. Iterates through all results
+        3. Packages them into a ResultSet for easy consumption
+
+        Returns:
+            ResultSet containing all query results.
+        """
         return ResultSet(list(self._output_row_iterator()), self.schema)
 
     async def _acollect(self) -> ResultSet:

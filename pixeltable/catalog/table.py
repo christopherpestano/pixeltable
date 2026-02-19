@@ -225,6 +225,25 @@ class Table(SchemaObject):
     def select(self, *items: Any, **named_items: Any) -> 'pxt.Query':
         """Select columns or expressions from this table.
 
+        This is the entry point for building queries in Pixeltable. It creates a
+        Query object that can be further refined with where(), order_by(), etc.
+
+        Execution Pipeline (when collect() is called):
+            1. Query._create_query_plan() builds an ExecNode tree
+            2. Planner creates SqlScanNode (fetches from DB) + ExprEvalNode (computes UDFs)
+            3. ExecNode tree is iterated, yielding DataRowBatch objects
+            4. Results collected into ResultSet
+
+        Args:
+            *items: Columns or expressions to select
+            **named_items: Named expressions (name=expr) for the output
+
+        Returns:
+            A Query object that can be chained with other operations.
+
+        Example:
+            >>> t.select(t.col_a, doubled=t.col_b * 2).where(t.col_a > 5).collect()
+
         See [`Query.select`][pixeltable.Query.select] for more details.
         """
         from pixeltable.catalog import Catalog
