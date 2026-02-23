@@ -352,73 +352,302 @@ class ExprEvalNode(ExecNode):
         self.dispatch(rows, exec_ctx)
 
     def dispatch(self, rows: list[exprs.DataRow], exec_ctx: ExprEvalCtx) -> None:
-        """Dispatch rows to slot evaluators, based on materialized dependencies"""
+        """
+        Dispatch rows to slot evaluators, based on materialized dependencies.
+
+        This is the CORE SCHEDULING FUNCTION of the expression evaluation engine.
+        It determines which "slots" (think: columns or computed expressions) are ready
+        to be evaluated for each row, and schedules them for execution.
+
+        CONCEPTUAL OVERVIEW:
+        --------------------
+        Imagine a spreadsheet where some cells depend on other cells (like formulas).
+        You can't compute cell C until cells A and B have values (if C = A + B).
+        This method figures out which cells are "ready" (all their inputs are available)
+        and sends them off to be computed.
+
+        TERMINOLOGY:
+        ------------
+        - "Slot": A position in a row that holds a value. Each expression/column gets a slot.
+                  Think of it as a cell in a spreadsheet row.
+        - "Row": A single data record with multiple slots (like a row in a spreadsheet).
+        - "Dependencies": Other slots that must be computed BEFORE a given slot can be computed.
+                          For example, if slot 3 = slot 1 + slot 2, then slots 1 and 2 are
+                          dependencies of slot 3.
+        - "Materialized": A slot is materialized when it has an actual value computed and stored.
+        - "Evaluator": An object that knows how to compute the value for a specific slot.
+
+        WHAT THIS METHOD DOES (step by step):
+        -------------------------------------
+        1. For each row, figure out which slots are now "ready" to be evaluated
+        2. Track which rows are completely done (all output slots have values)
+        3. Clean up memory by garbage-collecting intermediate values we no longer need
+        4. Send completed rows to the output queue
+        5. Schedule ready slots to their evaluators for actual computation
+
+        Args:
+            rows: List of DataRow objects to process. Each row contains slots that may
+                  or may not have values yet.
+            exec_ctx: The ExprEvalCtx (expression evaluation context) that holds metadata
+                      about how expressions relate to each other (dependencies, evaluators, etc.)
+        """
+        # =====================================================================
+        # EARLY EXIT CHECK
+        # =====================================================================
+        # If there are no rows to process, or if an exception has already been raised
+        # somewhere else in the system (exc_event is set), just return immediately.
+        # No point doing work if we're going to throw everything away due to an error.
         if len(rows) == 0 or self.exc_event.is_set():
             return
 
-        # Slots ready for evaluation: a slot is ready when all its dependencies have values
-        # Matrix shape: rows x slots, True indicates the slot is ready for that row
+        # =====================================================================
+        # INITIALIZE TRACKING MATRICES
+        # =====================================================================
+        # We use NumPy boolean arrays for efficient batch operations.
+
+        # ready_slots: A 2D matrix where ready_slots[row_index][slot_index] = True
+        # means "for this row, this slot is ready to be evaluated (all its dependencies
+        # have values)".
+        # Shape: (number of rows) x (number of slots in a row)
+        # Example: If we have 3 rows and 5 slots, this is a 3x5 matrix of False values initially.
         ready_slots = np.zeros((len(rows), exec_ctx.row_builder.num_materialized), dtype=bool)
+
+        # completed_rows: A 1D array where completed_rows[row_index] = True means
+        # "this row is completely done - all its output slots have values".
+        # Shape: (number of rows,)
         completed_rows = np.zeros(len(rows), dtype=bool)
+
+        # num_computed_outputs: Counter for how many output slot values we computed.
+        # Used for progress reporting (showing the user how much work has been done).
         num_computed_outputs = 0
+
+        # =====================================================================
+        # MAIN LOOP: Process each row to determine what's ready and what's done
+        # =====================================================================
         for i, row in enumerate(rows):
-            # row.missing_slots &= row.has_val == False
+            # -----------------------------------------------------------------
+            # SHAPE VALIDATION (currently a no-op, but left for debugging)
+            # -----------------------------------------------------------------
+            # This check verifies that the row's missing_slots array has the same
+            # shape as self.outputs. If they don't match, something is wrong with
+            # how the row was constructed. The 'pass' here suggests this might be
+            # a placeholder for future error handling or debugging code.
             if row.missing_slots.shape != self.outputs.shape:
                 pass
 
+            # -----------------------------------------------------------------
+            # TRACK PROGRESS FOR OUTPUT SLOTS
+            # -----------------------------------------------------------------
+            # We only count newly-computed OUTPUT slots (the final results the user wants),
+            # not intermediate computed values. This is for the progress bar.
+            #
+            # self.eval_ctx is the "top-level" context for the main query.
+            # exec_ctx might be a nested context (e.g., inside a JSON mapper).
+            # We only report progress for the top-level context.
             if self.eval_ctx is exec_ctx:
-                # if this is the top-level ExprEvalCtx (instead of the one for a JsonMapperDispatcher), we want to count
-                # the newly-materialized output slots
+                # Count how many output slots are STILL missing (before we update).
+                # row.missing_slots: boolean array, True = "this slot still needs a value"
+                # self.outputs: boolean array, True = "this slot is an output we care about"
+                # The bitwise AND gives us "output slots that are still missing".
                 missing_outputs = (row.missing_slots & self.outputs).sum()
+
+                # Update missing_slots: a slot is still "missing" only if it BOTH:
+                #   1. Was marked as missing (row.missing_slots is True)
+                #   2. Still doesn't have a value (row.has_val is False)
+                # After this line, missing_slots only contains slots that are TRULY still missing.
                 row.missing_slots &= row.has_val == False
+
+                # Count how many output slots we just "computed" (were missing before, have values now).
+                # This is: (missing before) - (missing after)
                 num_computed_outputs += missing_outputs - (row.missing_slots & self.outputs).sum()
             else:
+                # For nested contexts, we still update missing_slots but don't track progress.
                 row.missing_slots &= row.has_val == False
 
+            # -----------------------------------------------------------------
+            # CHECK IF ROW IS COMPLETE
+            # -----------------------------------------------------------------
+            # If no slots are missing (sum of missing_slots is 0), the row is done!
             if row.missing_slots.sum() == 0:
-                # all output slots have been materialized
                 completed_rows[i] = True
             else:
-                # dependencies of missing slots
+                # -----------------------------------------------------------------
+                # DETERMINE WHICH SLOTS ARE READY FOR EVALUATION
+                # -----------------------------------------------------------------
+                # A slot is "ready" when ALL of the following are true:
+                #   1. All its dependencies have values (no missing dependencies)
+                #   2. It hasn't been scheduled for evaluation yet
+                #   3. It's still missing (we haven't computed it yet)
+
+                # Step A: Get the number of dependencies for each MISSING slot.
+                #
+                # EXAMPLE: Suppose we have 5 slots representing these expressions:
+                #   Slot 0: input column "name"        (no dependencies)
+                #   Slot 1: input column "age"         (no dependencies)
+                #   Slot 2: upper(name)                (depends on slot 0)
+                #   Slot 3: age + 10                   (depends on slot 1)
+                #   Slot 4: concat(upper(name), age)   (depends on slots 2 and 3)
+                #
+                # num_dependencies would be: [0, 0, 1, 1, 2]
+                #   - Slot 0 has 0 dependencies (it's an input)
+                #   - Slot 1 has 0 dependencies (it's an input)
+                #   - Slot 2 has 1 dependency (slot 0)
+                #   - Slot 3 has 1 dependency (slot 1)
+                #   - Slot 4 has 2 dependencies (slots 2 and 3)
+                #
+                # If missing_slots is [False, False, True, True, True] (we need slots 2,3,4):
+                # missing_dependencies = [0, 0, 1, 1, 2] * [False, False, True, True, True]
+                #                      = [0, 0, 1, 1, 2]  (zeros out slots we don't care about)
                 missing_dependencies = exec_ctx.row_builder.num_dependencies * row.missing_slots
-                # determine ready slots that are not yet materialized and not yet scheduled
+
+                # Step B: Count how many dependencies are already MATERIALIZED (have values).
+                #
+                # dependencies is a 2D matrix (slots x slots) where dependencies[i][j] = True
+                # means "slot i depends on slot j".
+                #
+                # EXAMPLE (continuing from above):
+                # dependencies matrix:
+                #        slot0  slot1  slot2  slot3  slot4
+                # slot0 [False, False, False, False, False]  (no deps)
+                # slot1 [False, False, False, False, False]  (no deps)
+                # slot2 [True,  False, False, False, False]  (depends on slot 0)
+                # slot3 [False, True,  False, False, False]  (depends on slot 1)
+                # slot4 [False, False, True,  True,  False]  (depends on slots 2 and 3)
+                #
+                # If has_val is [True, True, False, False, False] (inputs are populated):
+                # dependencies * has_val broadcasts has_val across rows:
+                #        [True, True, False, False, False]
+                # slot2: [True, False, False, False, False] → sum = 1 (slot 0 is ready)
+                # slot3: [False, True, False, False, False] → sum = 1 (slot 1 is ready)
+                # slot4: [False, False, False, False, False] → sum = 0 (slots 2,3 not ready)
+                #
+                # So num_mat_dependencies = [0, 0, 1, 1, 0]
                 num_mat_dependencies = np.sum(exec_ctx.row_builder.dependencies * row.has_val, axis=1)
+
+                # Step C: Calculate how many dependencies are still MISSING for each slot.
+                #
+                # EXAMPLE (continuing):
+                # missing_dependencies = [0, 0, 1, 1, 2]
+                # num_mat_dependencies = [0, 0, 1, 1, 0]
+                # num_missing           = [0, 0, 0, 0, 2]
+                #
+                # Slots 2 and 3 have num_missing=0, meaning ALL their dependencies are satisfied!
+                # Slot 4 has num_missing=2, meaning it's still waiting for 2 dependencies.
                 num_missing = missing_dependencies - num_mat_dependencies
+
+                # Step D: A slot is "ready" if:
+                #   - num_missing == 0 (all dependencies satisfied)
+                #   - is_scheduled == False (not already queued for evaluation)
+                #   - missing_slots == True (we still need to compute it)
+                #
+                # EXAMPLE (continuing):
+                # num_missing == 0:    [True,  True,  True,  True,  False]
+                # is_scheduled==False: [True,  True,  True,  True,  True ]  (nothing scheduled yet)
+                # missing_slots:       [False, False, True,  True,  True ]
+                # Result (AND all):    [False, False, True,  True,  False]
+                #
+                # So slots 2 and 3 are ready! Slot 4 is not ready (still waiting on 2 and 3).
                 ready_slots[i] = (num_missing == 0) & (row.is_scheduled == False) & row.missing_slots
+
+                # Step E: Mark these slots as scheduled so we don't schedule them again.
                 row.is_scheduled |= ready_slots[i]
 
-            # Garbage collection: clear intermediate values when all their dependents have been computed.
-            # A slot can be cleared when: (1) no more slots depend on it (missing_dependents == 0),
-            # (2) it previously had dependents (row.missing_dependents > 0), and (3) it's not an output slot
+            # -----------------------------------------------------------------
+            # GARBAGE COLLECTION: Free memory from intermediate values
+            # -----------------------------------------------------------------
+            # Once all slots that depend on an intermediate value have been computed,
+            # we can clear that intermediate value to save memory.
+            #
+            # Think of it like this: if you computed A and B to get C, and C was the
+            # only thing that needed A and B, you can throw away A and B now.
+
+            # Count how many NOT-YET-COMPUTED slots depend on each slot.
+            # dependencies[row.has_val == False] selects rows of the dependency matrix
+            # for slots that DON'T have values yet.
+            # Summing along axis=0 counts, for each slot, how many uncomputed slots depend on it.
             missing_dependents = np.sum(exec_ctx.row_builder.dependencies[row.has_val == False], axis=0)
+
+            # A slot is a garbage collection target if:
+            #   1. missing_dependents == 0: No uncomputed slots need this value anymore
+            #   2. row.missing_dependents > 0: It USED to have dependents (meaning it was
+            #      an intermediate value, not just an unused slot)
+            #   3. exec_ctx.gc_targets: It's marked as OK to garbage collect (not an output)
             gc_targets = (missing_dependents == 0) & (row.missing_dependents > 0) & exec_ctx.gc_targets
+
+            # Actually clear the values in the row for these slots.
             row.clear(gc_targets)
+
+            # Update the row's tracking of how many dependents each slot has.
             row.missing_dependents = missing_dependents
 
+        # =====================================================================
+        # REPORT PROGRESS
+        # =====================================================================
+        # If we have a progress reporter and we computed some output values,
+        # tell the progress bar to update.
         if self.progress_reporter is not None and num_computed_outputs > 0:
             self.progress_reporter.update(int(num_computed_outputs))
 
+        # =====================================================================
+        # HANDLE COMPLETED ROWS
+        # =====================================================================
+        # Some rows may now be fully complete (all output slots have values).
+        # We need to either:
+        #   A) If they're "nested rows" (sub-rows of a parent row), notify the parent.
+        #   B) If they're top-level rows, put them in the output queue.
         if np.any(completed_rows):
+            # Get the indices of all completed rows (where completed_rows[i] == True).
+            # .nonzero() returns a tuple of arrays; [0] gets the first (and only) array.
             completed_idxs = list(completed_rows.nonzero()[0])
+
+            # Check if these are nested rows (rows that belong to a parent row).
+            # Nested rows are used for things like JSON array expansion, where one
+            # parent row produces multiple child rows.
             if rows[i].parent_row is not None:
-                # these are nested rows
+                # NESTED ROWS: Notify the parent that child rows are complete.
                 for i in completed_idxs:
                     row = rows[i]
+                    # Verify this is actually a nested row with proper parent linkage.
                     assert row.parent_row is not None and row.parent_slot_idx is not None
+                    # The parent's slot contains a NestedRowList that tracks all child rows.
                     assert isinstance(row.parent_row.vals[row.parent_slot_idx], NestedRowList)
+                    # Tell the NestedRowList that one more row is complete.
                     row.parent_row.vals[row.parent_slot_idx].complete_row()
             else:
+                # TOP-LEVEL ROWS: Put them in the output queue for the main event loop.
                 for i in completed_idxs:
+                    # put_nowait: Add to queue without blocking (we know queue won't be full).
                     self.completed_rows.put_nowait(rows[i])
+                # Signal that there are completed rows ready to be consumed.
                 self.completed_event.set()
+                # Decrease the count of rows we're still processing.
                 self.num_in_flight -= len(completed_idxs)
 
-        # schedule all ready slots
+        # =====================================================================
+        # SCHEDULE READY SLOTS FOR EVALUATION
+        # =====================================================================
+        # Now we actually send the ready slots to their evaluators to be computed.
+        #
+        # np.sum(ready_slots, axis=0) sums along the rows, giving us a count per slot
+        # of how many rows have that slot ready.
+        # .nonzero()[0] gives us the indices of slots where at least one row is ready.
         for slot_idx in np.sum(ready_slots, axis=0).nonzero()[0]:
+            # Get the column of ready_slots for this slot (which rows have it ready?).
             ready_rows_v = ready_slots[:, slot_idx].flatten()
-            _ = ready_rows_v.nonzero()
+
+            # Find the indices of rows where this slot is ready.
+            _ = ready_rows_v.nonzero()  # This line appears to be dead code / debugging artifact
+
+            # Build a list of the actual row objects that are ready for this slot.
             ready_rows = [rows[i] for i in ready_rows_v.nonzero()[0]]
+
+            # Log for debugging: how many rows are being scheduled for this slot.
             _logger.debug(f'Scheduling {len(ready_rows)} rows for slot {slot_idx}')
+
+            # Actually schedule the rows with the slot's evaluator.
+            # The evaluator knows how to compute values for this slot (e.g., run a function,
+            # call an API, etc.). It will eventually produce values and call dispatch()
+            # again when those values are ready.
             exec_ctx.slot_evaluators[slot_idx].schedule(ready_rows, slot_idx)
 
     def register_task(self, t: asyncio.Task) -> None:
