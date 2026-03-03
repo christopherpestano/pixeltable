@@ -1,3 +1,17 @@
+"""
+Arithmetic expression node for binary numeric operations.
+
+Implements the ``ArithmeticExpr`` class, which handles +, -, *, /, //, % operations
+on numeric expressions. Created by Expr's ``__add__``, ``__sub__``, ``__mul__``,
+``__truediv__``, ``__floordiv__``, and ``__mod__`` operator overloads.
+
+Key behaviors:
+- Type resolution: uses ``supertype()`` to find common numeric type; DIV always returns float
+- SQL translation: handles division-by-zero via NULLIF, floor division via FLOOR,
+  and CockroachDB type casting for mixed-type operands
+- Constant folding: if both operands are Literals, collapses to a single Literal
+- NULL propagation: if either operand is None/NULL, the result is None/NULL
+"""
 from __future__ import annotations
 
 from typing import Any
@@ -15,13 +29,23 @@ from .sql_element_cache import SqlElementCache
 
 
 class ArithmeticExpr(Expr):
-    """
-    Allows arithmetic exprs on json paths
+    """Binary arithmetic expression node (e.g., ``t.col1 + t.col2``).
+
+    Composes two numeric operand expressions with an arithmetic operator.
+    Supports both SQL push-down and Python evaluation. The result type
+    is determined by the supertype of the operands, except for DIV which
+    always produces FloatType.
+
+    Components:
+        components[0]: left operand
+        components[1]: right operand
     """
 
     operator: ArithmeticOperator
 
     def __init__(self, operator: ArithmeticOperator, op1: Expr, op2: Expr):
+        # Type resolution: DIV always produces float; JSON operands assumed float;
+        # otherwise use supertype of the two operand types
         if op1.col_type.is_json_type() or op2.col_type.is_json_type() or operator == ArithmeticOperator.DIV:
             # we assume it's a float
             super().__init__(ts.FloatType(nullable=(op1.col_type.nullable or op2.col_type.nullable)))
@@ -40,10 +64,12 @@ class ArithmeticExpr(Expr):
 
     @property
     def _op1(self) -> Expr:
+        """Left operand expression."""
         return self.components[0]
 
     @property
     def _op2(self) -> Expr:
+        """Right operand expression."""
         return self.components[1]
 
     def __repr__(self) -> str:
@@ -59,12 +85,22 @@ class ArithmeticExpr(Expr):
         return [*super()._id_attrs(), ('operator', self.operator.value)]
 
     def sql_expr(self, sql_elements: SqlElementCache) -> sql.ColumnElement | None:
+        """Translate to a SQL arithmetic expression.
+
+        Returns None if either operand cannot be translated to SQL.
+        Handles special cases:
+        - CockroachDB requires explicit casting for mixed-type arithmetic
+        - DIV uses NULLIF to avoid division-by-zero, casts to float
+        - MOD on floats is not supported in Postgres, falls back to Python
+        - FLOORDIV uses FLOOR(a/b) to match Python's // semantics (round toward -inf)
+        """
         assert self.col_type.is_int_type() or self.col_type.is_float_type() or self.col_type.is_json_type()
         left = sql_elements.get(self._op1)
         right = sql_elements.get(self._op2)
         if left is None or right is None:
             return None
         if self.operator in (ArithmeticOperator.ADD, ArithmeticOperator.SUB, ArithmeticOperator.MUL):
+            # CockroachDB requires explicit type casting when operand types differ
             if env.Env.get().is_using_cockroachdb and self._op1.col_type != self._op2.col_type:
                 if self._op1.col_type != self.col_type:
                     left = sql.cast(left, self.col_type.to_sa_type())
@@ -103,6 +139,11 @@ class ArithmeticExpr(Expr):
         raise AssertionError()
 
     def eval(self, data_row: DataRow, row_builder: RowBuilder) -> None:
+        """Evaluate the arithmetic expression in Python.
+
+        Reads operand values from data_row, performs dynamic type checking for
+        JSON-typed operands, and stores the result (or None for NULL propagation).
+        """
         op1_val = data_row[self._op1.slot_idx]
         op2_val = data_row[self._op2.slot_idx]
 
@@ -145,6 +186,7 @@ class ArithmeticExpr(Expr):
             return op1_val // op2_val
 
     def as_literal(self) -> Literal | None:
+        """Attempt constant folding: if both operands are Literals, compute the result now."""
         op1_lit = self._op1.as_literal()
         if op1_lit is None:
             return None
