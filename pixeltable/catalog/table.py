@@ -25,6 +25,7 @@ from pixeltable.catalog.table_metadata import (
 )
 from pixeltable.metadata import schema
 from pixeltable.metadata.utils import MetadataUtils
+from pixeltable.runtime import get_runtime
 from pixeltable.types import ColumnSpec
 from pixeltable.utils.formatter import Formatter
 from pixeltable.utils.object_stores import ObjectOps
@@ -83,7 +84,7 @@ class Table(SchemaObject):
         old_name = self._name
         old_dir_id = self._dir_id
 
-        cat = catalog.Catalog.get()
+        cat = get_runtime().catalog
 
         @cat.register_undo_action
         def _() -> None:
@@ -92,7 +93,7 @@ class Table(SchemaObject):
             self._dir_id = old_dir_id
 
         super()._move(new_name, new_dir_id)
-        conn = env.Env.get().conn
+        conn = get_runtime().conn
         stmt = sql.text(
             (
                 f'UPDATE {schema.Table.__table__} '
@@ -134,6 +135,8 @@ class Table(SchemaObject):
                 media_validation=col.media_validation.name.lower() if col.media_validation is not None else None,  # type: ignore[typeddict-item]
                 computed_with=col.value_expr.display_str(inline=False) if col.value_expr is not None else None,
                 defined_in=col.get_tbl().name,
+                custom_metadata=col.custom_metadata,
+                comment=col.comment,
             )
 
         indices = tv.idxs_by_name.values()
@@ -175,8 +178,8 @@ class Table(SchemaObject):
         return self._tbl_version_path.version()
 
     def _get_pxt_uri(self) -> str | None:
-        with catalog.Catalog.get().begin_xact(tbl_id=self._id):
-            return catalog.Catalog.get().get_additional_md(self._id).get('pxt_uri')
+        with get_runtime().catalog.begin_xact(tbl_id=self._id):
+            return get_runtime().catalog.get_additional_md(self._id).get('pxt_uri')
 
     def __hash__(self) -> int:
         return hash(self._tbl_version_path.tbl_id)
@@ -213,7 +216,7 @@ class Table(SchemaObject):
         return op()
 
     def _get_views(self, *, recursive: bool = True, mutable_only: bool = False) -> list['Table']:
-        cat = catalog.Catalog.get()
+        cat = get_runtime().catalog
         view_ids = cat.get_view_ids(self._id)
         views = [cat.get_table_by_id(id) for id in view_ids]
         if mutable_only:
@@ -246,14 +249,13 @@ class Table(SchemaObject):
 
         See [`Query.select`][pixeltable.Query.select] for more details.
         """
-        from pixeltable.catalog import Catalog
         from pixeltable.plan import FromClause
 
         query = pxt.Query(FromClause(tbls=[self._tbl_version_path]))
         if len(items) == 0 and len(named_items) == 0:
             return query  # Select(*); no further processing is necessary
 
-        with Catalog.get().begin_xact(tbl=self._tbl_version_path, for_write=False):
+        with get_runtime().catalog.begin_xact(tbl=self._tbl_version_path, for_write=False):
             return query.select(*items, **named_items)
 
     def where(self, pred: 'exprs.Expr') -> 'pxt.Query':
@@ -261,18 +263,16 @@ class Table(SchemaObject):
 
         See [`Query.where`][pixeltable.Query.where] for more details.
         """
-        from pixeltable.catalog import Catalog
 
-        with Catalog.get().begin_xact(tbl=self._tbl_version_path, for_write=False):
+        with get_runtime().catalog.begin_xact(tbl=self._tbl_version_path, for_write=False):
             return self.select().where(pred)
 
     def join(
         self, other: 'Table', *, on: 'exprs.Expr' | None = None, how: 'pixeltable.plan.JoinType.LiteralType' = 'inner'
     ) -> 'pxt.Query':
         """Join this table with another table."""
-        from pixeltable.catalog import Catalog
 
-        with Catalog.get().begin_xact(tbl=self._tbl_version_path, for_write=False):
+        with get_runtime().catalog.begin_xact(tbl=self._tbl_version_path, for_write=False):
             return self.select().join(other, on=on, how=how)
 
     def order_by(self, *items: 'exprs.Expr', asc: bool = True) -> 'pxt.Query':
@@ -280,9 +280,8 @@ class Table(SchemaObject):
 
         See [`Query.order_by`][pixeltable.Query.order_by] for more details.
         """
-        from pixeltable.catalog import Catalog
 
-        with Catalog.get().begin_xact(tbl=self._tbl_version_path, for_write=False):
+        with get_runtime().catalog.begin_xact(tbl=self._tbl_version_path, for_write=False):
             return self.select().order_by(*items, asc=asc)
 
     def group_by(self, *items: 'exprs.Expr') -> 'pxt.Query':
@@ -290,9 +289,8 @@ class Table(SchemaObject):
 
         See [`Query.group_by`][pixeltable.Query.group_by] for more details.
         """
-        from pixeltable.catalog import Catalog
 
-        with Catalog.get().begin_xact(tbl=self._tbl_version_path, for_write=False):
+        with get_runtime().catalog.begin_xact(tbl=self._tbl_version_path, for_write=False):
             return self.select().group_by(*items)
 
     def distinct(self) -> 'pxt.Query':
@@ -408,12 +406,12 @@ class Table(SchemaObject):
         """
         Constructs a list of descriptors for this table that can be pretty-printed.
         """
-        from pixeltable.catalog import Catalog
 
-        with Catalog.get().begin_xact(tbl=self._tbl_version_path, for_write=False):
+        with get_runtime().catalog.begin_xact(tbl=self._tbl_version_path, for_write=False):
             helper = DescriptionHelper()
             helper.append(self._table_descriptor())
-            helper.append(self._col_descriptor())
+            col_df, separator_idxs = self._col_descriptor()
+            helper.append(col_df, separator_idxs=separator_idxs)
             idxs = self._index_descriptor()
             if not idxs.empty:
                 helper.append(idxs)
@@ -426,16 +424,50 @@ class Table(SchemaObject):
                 helper.append(f'Custom Metadata: {Formatter.summarize_json(self._get_custom_metadata())}')
             return helper
 
-    def _col_descriptor(self, columns: list[str] | None = None) -> pd.DataFrame:
-        return pd.DataFrame(
-            {
-                'Column Name': col.name,
-                'Type': col.col_type._to_str(as_schema=True),
-                'Computed With': col.value_expr.display_str(inline=False) if col.value_expr is not None else '',
-            }
-            for col in self._tbl_version_path.columns()
-            if columns is None or col.name in columns
-        )
+    def _col_descriptor(self, columns: list[str] | None = None) -> tuple[pd.DataFrame, list[int] | None]:
+        """Generates column descriptor DataFrame and a list of vertical separators.
+
+        The DataFrame contains the following columns, in addition to Column Name and Type:
+        - Source: the table from which the column is inherited, or this table's name if the column originates here.
+        - Computed With: The expression that Pixeltable evaluates to fill in this column's values. This could be a
+          Python expression, a UDF call, or an iterator name. Blank if the data in the row is not computed.
+
+        The separators are used to visually group columns by their Source when the table description is rendered.
+
+        Args:
+            columns: List of columns to include, or all columns if None.
+
+        Returns:
+            A tuple of the column descriptor DataFrame, and a list of row indexes after which a vertical separator
+            should be placed.
+        """
+        cols = [col for col in self._tbl_version_path.columns() if columns is None or col.name in columns]
+        col_descriptors: list[dict[str, str]] = []
+        separator_idxs: list[int] = []
+        prev_source: str | None = None
+        for i, col in enumerate(cols):
+            computed_with = col.value_expr.display_str(inline=False) if col.value_expr is not None else ''
+            source_tv = col.get_tbl()
+            if source_tv.is_iterator_column(col) or (source_tv.is_component_view and col.id == 0):
+                # col is an iterator column (including the special "pos" column) of an iterator view. Computed With
+                # should be the iterator class name.
+                assert source_tv.iterator_call is not None
+                computed_with = source_tv.iterator_call.it.name
+
+            col_descriptors.append(
+                {
+                    'Column Name': col.name,
+                    'Type': col.col_type._to_str(as_schema=True),
+                    'Source': source_tv.name,
+                    'Computed With': computed_with,
+                    'Comment': col.comment if col.comment is not None else '',
+                }
+            )
+            # Insert a separator if this column's source is different from the last one.
+            if prev_source is not None and source_tv.name != prev_source:
+                separator_idxs.append(i - 1)
+            prev_source = source_tv.name
+        return pd.DataFrame(col_descriptors), separator_idxs
 
     def _index_descriptor(self, columns: list[str] | None = None) -> pd.DataFrame:
         from pixeltable import index
@@ -492,7 +524,7 @@ class Table(SchemaObject):
         """Returns True if the column has dependents, False otherwise."""
         assert col is not None
         assert col.name in self._get_schema()
-        cat = catalog.Catalog.get()
+        cat = get_runtime().catalog
         if any(c.name is not None for c in cat.get_column_dependents(col.get_tbl().id, col.id)):
             return True
         assert self._tbl_version is not None
@@ -585,11 +617,10 @@ class Table(SchemaObject):
             ... }
             ... tbl.add_columns(schema)
         """
-        from pixeltable.catalog import Catalog
 
         # lock_mutable_tree=True: we might end up having to drop existing columns, which requires locking the tree
         new_cols: list[Column]
-        with Catalog.get().begin_xact(tbl=self._tbl_version_path, for_write=True, lock_mutable_tree=True):
+        with get_runtime().catalog.begin_xact(tbl=self._tbl_version_path, for_write=True, lock_mutable_tree=True):
             self.__check_mutable('add columns to')
 
             # make a copy of schema so del operations below don't modify the caller's dict
@@ -612,7 +643,7 @@ class Table(SchemaObject):
                 self._verify_column(new_col)
 
         assert self._tbl_version is not None
-        Catalog.get().add_columns(self._tbl_version_path, new_cols)
+        get_runtime().catalog.add_columns(self._tbl_version_path, new_cols)
         FileCache.get().emit_eviction_warnings()
         # TODO: return the row count here?
         return UpdateStatus()
@@ -736,9 +767,8 @@ class Table(SchemaObject):
 
             >>> tbl.add_computed_column(rotated=tbl.frame.rotate(90), stored=False)
         """
-        from pixeltable.catalog import Catalog
 
-        with Catalog.get().begin_xact(tbl=self._tbl_version_path, for_write=True, lock_mutable_tree=True):
+        with get_runtime().catalog.begin_xact(tbl=self._tbl_version_path, for_write=True, lock_mutable_tree=True):
             self.__check_mutable('add columns to')
             if len(kwargs) != 1:
                 raise excs.Error(
@@ -792,8 +822,8 @@ class Table(SchemaObject):
         """
         assert isinstance(spec, dict)
 
-        # TODO: this code could be made cleaner now that spec is a TypedDict
-        valid_keys = {'type', 'value', 'stored', 'media_validation', 'destination'}
+        # We cannot use get_type_hints() here since ColumnSpec doesn't import exprs outside of a TYPE_CHECKING block
+        valid_keys = ColumnSpec.__annotations__.keys()
         for k in spec:
             if k not in valid_keys:
                 raise excs.Error(f'Column {name!r}: invalid key {k!r}')
@@ -817,9 +847,21 @@ class Table(SchemaObject):
         if 'stored' in spec and not isinstance(spec['stored'], bool):
             raise excs.Error(f"Column {name!r}: 'stored' must be a bool; got {spec['stored']}")
 
+        if 'comment' in spec and not isinstance(spec['comment'], str):
+            raise excs.Error(f"Column {name!r}: 'comment' must be a string; got {spec['comment']}")
+
         d = spec.get('destination')
         if d is not None and not isinstance(d, (str, Path)):
             raise excs.Error(f'Column {name!r}: `destination` must be a string or path; got {d}')
+
+        if 'custom_metadata' in spec:
+            # we require custom_metadata to be JSON-serializable
+            try:
+                json.dumps(spec['custom_metadata'])
+            except (TypeError, ValueError) as err:
+                raise excs.Error(
+                    f'Column {name!r}: `custom_metadata` must be JSON-serializable; got Error: {err}'
+                ) from err
 
     @classmethod
     def _create_columns(cls, schema: Mapping[str, type | ColumnSpec | exprs.Expr]) -> list[Column]:
@@ -832,6 +874,8 @@ class Table(SchemaObject):
             media_validation: catalog.MediaValidation | None = None
             stored = True
             destination: str | Path | None = None
+            custom_metadata: Any = None
+            comment: str | None = None
 
             # TODO: Should we fully deprecate passing ts.ColumnType here?
             if isinstance(spec, (ts.ColumnType, type, _GenericAlias)):
@@ -858,6 +902,11 @@ class Table(SchemaObject):
                     catalog.MediaValidation[media_validation_str.upper()] if media_validation_str is not None else None
                 )
                 destination = spec.get('destination')
+                custom_metadata = spec.get('custom_metadata')
+                comment = spec.get('comment')
+                if comment == '':
+                    comment = None
+
             else:
                 raise excs.Error(f'Invalid value for column {name!r}')
 
@@ -869,6 +918,8 @@ class Table(SchemaObject):
                 is_pk=primary_key,
                 media_validation=media_validation,
                 destination=destination,
+                custom_metadata=custom_metadata,
+                comment=comment,
             )
             # Validate the column's resolved_destination. This will ensure that if the column uses a default (global)
             # media destination, it gets validated at this time.
@@ -937,9 +988,8 @@ class Table(SchemaObject):
             >>> tbl = pxt.get_table('my_table')
             ... tbl.drop_col(tbl.col, if_not_exists='ignore')
         """
-        from pixeltable.catalog import Catalog
 
-        cat = Catalog.get()
+        cat = get_runtime().catalog
 
         # lock_mutable_tree=True: we need to be able to see whether any transitive view has column dependents
         with cat.begin_xact(tbl=self._tbl_version_path, for_write=True, lock_mutable_tree=True):
@@ -1038,9 +1088,8 @@ class Table(SchemaObject):
             >>> tbl = pxt.get_table('my_table')
             ... tbl.rename_column('col1', 'col2')
         """
-        from pixeltable.catalog import Catalog
 
-        with Catalog.get().begin_xact(tbl=self._tbl_version_path, for_write=True, lock_mutable_tree=False):
+        with get_runtime().catalog.begin_xact(tbl=self._tbl_version_path, for_write=True, lock_mutable_tree=False):
             self._tbl_version.get().rename_column(old_name, new_name)
 
     def _list_index_info_for_test(self) -> list[dict[str, Any]]:
@@ -1147,9 +1196,8 @@ class Table(SchemaObject):
             ...     image_embed=image_embedding_fn,
             ... )
         """
-        from pixeltable.catalog import Catalog
 
-        with Catalog.get().begin_xact(tbl=self._tbl_version_path, for_write=True, lock_mutable_tree=True):
+        with get_runtime().catalog.begin_xact(tbl=self._tbl_version_path, for_write=True, lock_mutable_tree=True):
             self.__check_mutable('add an index to')
             col = self._resolve_column_parameter(column)
 
@@ -1233,12 +1281,11 @@ class Table(SchemaObject):
             >>> tbl = pxt.get_table('my_table')
             ... tbl.drop_embedding_index(idx_name='idx1', if_not_exists='ignore')
         """
-        from pixeltable.catalog import Catalog
 
         if (column is None) == (idx_name is None):
             raise excs.Error("Exactly one of 'column' or 'idx_name' must be provided")
 
-        with Catalog.get().begin_xact(tbl=self._tbl_version_path, for_write=True, lock_mutable_tree=True):
+        with get_runtime().catalog.begin_xact(tbl=self._tbl_version_path, for_write=True, lock_mutable_tree=True):
             col: Column = None
             if idx_name is None:
                 col = self._resolve_column_parameter(column)
@@ -1312,12 +1359,11 @@ class Table(SchemaObject):
             ... tbl.drop_index(idx_name='idx1', if_not_exists='ignore')
 
         """
-        from pixeltable.catalog import Catalog
 
         if (column is None) == (idx_name is None):
             raise excs.Error("Exactly one of 'column' or 'idx_name' must be provided")
 
-        with Catalog.get().begin_xact(tbl=self._tbl_version_path, for_write=True, lock_mutable_tree=False):
+        with get_runtime().catalog.begin_xact(tbl=self._tbl_version_path, for_write=True, lock_mutable_tree=True):
             col: Column = None
             if idx_name is None:
                 col = self._resolve_column_parameter(column)
@@ -1333,8 +1379,6 @@ class Table(SchemaObject):
         _idx_class: type[index.IndexBase] | None = None,
         if_not_exists: Literal['error', 'ignore'] = 'error',
     ) -> None:
-        from pixeltable.catalog import Catalog
-
         self.__check_mutable('drop an index from')
         assert (col is None) != (idx_name is None)
 
@@ -1367,9 +1411,8 @@ class Table(SchemaObject):
 
         # Find out if anything depends on this index
         val_col = idx_info.val_col
-        dependent_user_cols = [
-            c for c in Catalog.get().get_column_dependents(val_col.get_tbl().id, val_col.id) if c.name is not None
-        ]
+        col_dependents = get_runtime().catalog.get_column_dependents(val_col.get_tbl().id, val_col.id)
+        dependent_user_cols = [c for c in col_dependents if c.name is not None]
         if len(dependent_user_cols) > 0:
             raise excs.Error(
                 f'Cannot drop index {idx_info.name!r} because the following columns depend on it:\n'
@@ -1517,9 +1560,8 @@ class Table(SchemaObject):
 
             >>> tbl.update({'int_col': tbl.int_col + 1}, where=tbl.int_col == 0)
         """
-        from pixeltable.catalog import Catalog
 
-        with Catalog.get().begin_xact(tbl=self._tbl_version_path, for_write=True, lock_mutable_tree=True):
+        with get_runtime().catalog.begin_xact(tbl=self._tbl_version_path, for_write=True, lock_mutable_tree=True):
             self.__check_mutable('update')
             result = self._tbl_version.get().update(value_spec, where, cascade)
             FileCache.get().emit_eviction_warnings()
@@ -1565,9 +1607,8 @@ class Table(SchemaObject):
             ...     if_not_exists='insert',
             ... )
         """
-        from pixeltable.catalog import Catalog
 
-        with Catalog.get().begin_xact(tbl=self._tbl_version_path, for_write=True, lock_mutable_tree=True):
+        with get_runtime().catalog.begin_xact(tbl=self._tbl_version_path, for_write=True, lock_mutable_tree=True):
             self.__check_mutable('update')
             rows = list(rows)
 
@@ -1642,9 +1683,8 @@ class Table(SchemaObject):
 
             >>> tbl.recompute_columns('c1', errors_only=True)
         """
-        from pixeltable.catalog import Catalog
 
-        cat = Catalog.get()
+        cat = get_runtime().catalog
         # lock_mutable_tree=True: we need to be able to see whether any transitive view has column dependents
         with cat.begin_xact(tbl=self._tbl_version_path, for_write=True, lock_mutable_tree=True):
             self.__check_mutable('recompute columns of')
@@ -1706,7 +1746,7 @@ class Table(SchemaObject):
         .. warning::
             This operation is irreversible.
         """
-        with catalog.Catalog.get().begin_xact(tbl=self._tbl_version_path, for_write=True, lock_mutable_tree=True):
+        with get_runtime().catalog.begin_xact(tbl=self._tbl_version_path, for_write=True, lock_mutable_tree=True):
             self.__check_mutable('revert')
             self._tbl_version.get().revert()
             # remove cached md in order to force a reload on the next operation
@@ -1782,9 +1822,8 @@ class Table(SchemaObject):
         """
         Links the specified `ExternalStore` to this table.
         """
-        from pixeltable.catalog import Catalog
 
-        with Catalog.get().begin_xact(tbl=self._tbl_version_path, for_write=True, lock_mutable_tree=False):
+        with get_runtime().catalog.begin_xact(tbl=self._tbl_version_path, for_write=True, lock_mutable_tree=False):
             self.__check_mutable('link an external store to')
             if store.name in self.external_stores():
                 raise excs.Error(f'Table {self._name!r} already has an external store with that name: {store.name}')
@@ -1808,11 +1847,10 @@ class Table(SchemaObject):
             delete_external_data (bool): If `True`, then the external data store will also be deleted. WARNING: This
                 is a destructive operation that will delete data outside Pixeltable, and cannot be undone.
         """
-        from pixeltable.catalog import Catalog
 
         if not self._tbl_version_path.is_mutable():
             return
-        with Catalog.get().begin_xact(tbl=self._tbl_version_path, for_write=True, lock_mutable_tree=False):
+        with get_runtime().catalog.begin_xact(tbl=self._tbl_version_path, for_write=True, lock_mutable_tree=False):
             all_stores = self.external_stores()
 
             if stores is None:
@@ -1848,14 +1886,13 @@ class Table(SchemaObject):
             export_data: If `True`, data from this table will be exported to the external stores during synchronization.
             import_data: If `True`, data from the external stores will be imported to this table during synchronization.
         """
-        from pixeltable.catalog import Catalog
 
         if not self._tbl_version_path.is_mutable():
             return UpdateStatus()
         # we lock the entire tree starting at the root base table in order to ensure that all synced columns can
         # have their updates propagated down the tree
         base_tv = self._tbl_version_path.get_tbl_versions()[-1]
-        with Catalog.get().begin_xact(tbl=TableVersionPath(base_tv), for_write=True, lock_mutable_tree=True):
+        with get_runtime().catalog.begin_xact(tbl=TableVersionPath(base_tv), for_write=True, lock_mutable_tree=True):
             all_stores = self.external_stores()
 
             if stores is None:
@@ -1904,7 +1941,6 @@ class Table(SchemaObject):
 
             >>> tbl.get_versions(n=5)
         """
-        from pixeltable.catalog import Catalog
 
         if n is None:
             n = 1_000_000_000
@@ -1914,7 +1950,7 @@ class Table(SchemaObject):
         # Retrieve the table history components from the catalog
         tbl_id = self._id
         # Collect an extra version, if available, to allow for computation of the first version's schema change
-        vers_list = Catalog.get().collect_tbl_history(tbl_id, n + 1)
+        vers_list = get_runtime().catalog.collect_tbl_history(tbl_id, n + 1)
 
         # Construct the metadata change description dictionary
         md_list = [(vers_md.version_md.version, vers_md.schema_version_md.columns) for vers_md in vers_list]
