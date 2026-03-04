@@ -1,8 +1,15 @@
 """
-Pixeltable UDFs
-that wrap various endpoints from the Anthropic API. In order to use them, you must
-first `pip install anthropic` and configure your Anthropic credentials, as described in
-the [Working with Anthropic](https://docs.pixeltable.com/notebooks/integrations/working-with-anthropic) tutorial.
+Pixeltable UDFs that wrap the Anthropic Messages API.
+
+This module provides the ``messages`` UDF for calling Anthropic's Claude models, along with
+adaptive rate-limit handling that reads ``anthropic-ratelimit-*`` response headers to throttle
+requests automatically. It also includes tool-calling support via ``invoke_tools``.
+
+In order to use these UDFs, you must first ``pip install anthropic`` and configure your
+Anthropic credentials, as described in the
+[Working with Anthropic](https://docs.pixeltable.com/notebooks/integrations/working-with-anthropic) tutorial.
+
+Environment variable: ``ANTHROPIC_API_KEY``
 """
 
 import datetime
@@ -25,18 +32,23 @@ if TYPE_CHECKING:
 _logger = logging.getLogger('pixeltable')
 
 
+# Register the Anthropic async client factory. The client is created lazily
+# when the first Anthropic UDF is called, using the API key from the
+# Pixeltable config or ANTHROPIC_API_KEY environment variable.
 @env.register_client('anthropic')
 def _(api_key: str) -> 'anthropic.AsyncAnthropic':
     import anthropic
 
     return anthropic.AsyncAnthropic(
         api_key=api_key,
-        # recommended to increase limits for async client to avoid connection errors
+        # Increase connection pool limits for the async client to avoid
+        # connection errors under high concurrency during batch processing.
         http_client=httpx.AsyncClient(limits=httpx.Limits(max_keepalive_connections=100, max_connections=500)),
     )
 
 
 def _anthropic_client() -> 'anthropic.AsyncAnthropic':
+    """Retrieve the shared Anthropic async client from the Pixeltable runtime."""
     return get_runtime().get_client('anthropic')
 
 
@@ -99,10 +111,20 @@ def _get_header_info(
 
 
 class AnthropicRateLimitsInfo(env.RateLimitsInfo):
+    """Tracks Anthropic rate limits across three dimensions: requests, input tokens, and output tokens.
+
+    On each API response (success or error), the ``anthropic-ratelimit-*`` headers are parsed
+    to update capacity estimates. Request scheduling is then throttled to stay within limits.
+    """
+
     def __init__(self) -> None:
         super().__init__(self._get_request_resources)
 
     def _get_request_resources(self, messages: dict, max_tokens: int) -> dict[str, int]:
+        """Estimate the resource cost of a request before sending it.
+
+        Uses a rough heuristic of ~4 characters per token for input estimation.
+        """
         input_len = 0
         for message in messages:
             if 'role' in message:
@@ -204,7 +226,8 @@ async def messages(
         model_kwargs = {}
 
     if tools is not None:
-        # Reformat `tools` into Anthropic format
+        # Convert Pixeltable's generic tool schema into the Anthropic-specific
+        # tool format, which uses 'input_schema' instead of 'parameters'.
         model_kwargs['tools'] = [
             {
                 'name': tool['name'],
@@ -219,6 +242,10 @@ async def messages(
         ]
 
     if tool_choice is not None:
+        # Map Pixeltable's unified tool_choice dict to Anthropic's format:
+        #   auto -> {'type': 'auto'}
+        #   required -> {'type': 'any'} (Anthropic calls it 'any')
+        #   specific tool -> {'type': 'tool', 'name': ...}
         if tool_choice['auto']:
             model_kwargs['tool_choice'] = {'type': 'auto'}
         elif tool_choice['required']:
@@ -229,7 +256,7 @@ async def messages(
         if not tool_choice['parallel_tool_calls']:
             model_kwargs['tool_choice']['disable_parallel_tool_use'] = True
 
-    # make sure the pool info exists prior to making the request
+    # Ensure the per-model rate limit pool exists before making the request.
     resource_pool_id = f'rate-limits:anthropic:{model}'
     rate_limits_info = env.Env.get().get_resource_pool_info(resource_pool_id, AnthropicRateLimitsInfo)
     assert isinstance(rate_limits_info, env.RateLimitsInfo)
@@ -239,10 +266,12 @@ async def messages(
 
     start_ts = datetime.datetime.now(tz=datetime.timezone.utc)
 
+    # Use with_raw_response to get access to HTTP headers for rate-limit tracking.
     result = await _anthropic_client().messages.with_raw_response.create(
         messages=cast(Iterable[MessageParam], messages), model=model, max_tokens=max_tokens, **model_kwargs
     )
 
+    # Parse rate-limit headers from the response and update the rate limiter.
     requests_info, input_tokens_info, output_tokens_info = _get_header_info(result.headers)
     # retry_after_str = result.headers.get('retry-after')
     # if retry_after_str is not None:
@@ -256,22 +285,38 @@ async def messages(
         reset_exc=is_retry,
     )
 
+    # Parse the JSON response body from the raw HTTP response text.
     result_dict = json.loads(result.text)
     return result_dict
 
 
+# Dynamic resource pool assignment: each model gets its own rate-limit pool
+# so that different Anthropic models are throttled independently.
 @messages.resource_pool
 def _(model: str) -> str:
     return f'rate-limits:anthropic:{model}'
 
 
 def invoke_tools(tools: Tools, response: exprs.Expr) -> exprs.InlineDict:
-    """Converts an Anthropic response dict to Pixeltable tool invocation format and calls `tools._invoke()`."""
+    """Convert an Anthropic response to Pixeltable tool invocations and execute them.
+
+    This bridges Anthropic's tool_use response format to Pixeltable's unified tool
+    invocation system. It extracts tool_use content blocks from the response, converts
+    them to Pixeltable's {tool_name: [{args: ...}]} format, and dispatches execution.
+    """
     return tools._invoke(_anthropic_response_to_pxt_tool_calls(response))
 
 
 @pxt.udf
 def _anthropic_response_to_pxt_tool_calls(response: dict) -> dict | None:
+    """Internal UDF that extracts tool calls from an Anthropic response dict.
+
+    Anthropic returns tool invocations as content blocks with type='tool_use'.
+    This function collects them into Pixeltable's normalized format:
+    {tool_name: [{'args': {...}}, ...]} grouped by tool name.
+
+    Returns None if no tool calls are present.
+    """
     anthropic_tool_calls = [r for r in response['content'] if r['type'] == 'tool_use']
     if len(anthropic_tool_calls) == 0:
         return None
@@ -280,6 +325,7 @@ def _anthropic_response_to_pxt_tool_calls(response: dict) -> dict | None:
         tool_name = tool_call['name']
         if tool_name not in pxt_tool_calls:
             pxt_tool_calls[tool_name] = []
+        # Anthropic uses 'input' for tool arguments; Pixeltable normalizes to 'args'.
         pxt_tool_calls[tool_name].append({'args': tool_call['input']})
     return pxt_tool_calls
 

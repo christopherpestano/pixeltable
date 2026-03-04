@@ -1,8 +1,16 @@
 """
 Pixeltable UDFs for AWS Bedrock AI models.
 
-Provides integration with AWS Bedrock for accessing various foundation models
-including Anthropic Claude, Amazon Titan, and other providers.
+This module wraps the AWS Bedrock Runtime API, providing:
+- ``converse``: High-level conversation API (Bedrock Converse endpoint) with tool-calling support.
+- ``invoke_model``: Low-level raw model invocation for any Bedrock model.
+- ``embed``: Text and image embedding via Amazon Titan and Nova embedding models.
+- ``invoke_tools``: Bridges Bedrock tool-use responses to Pixeltable's tool invocation system.
+
+Authentication uses standard AWS credentials (via boto3) or Bedrock API Key bearer tokens.
+
+Environment variables: ``AWS_ACCESS_KEY_ID``, ``AWS_SECRET_ACCESS_KEY``, ``AWS_DEFAULT_REGION``,
+or ``BEDROCK_API_KEY`` for bearer token auth.
 """
 
 import asyncio
@@ -26,6 +34,9 @@ if TYPE_CHECKING:
 _logger = logging.getLogger('pixeltable')
 
 
+# Register the Bedrock client factory. Supports two auth modes:
+# 1. Bearer token (api_key provided) -- injects token into each request header.
+# 2. Standard AWS credentials (default) -- uses boto3's credential chain.
 @env.register_client('bedrock')
 def _(api_key: str | None = None, region_name: str | None = None) -> 'BaseClient':
     import boto3
@@ -58,7 +69,8 @@ def _bedrock_client() -> Any:
     return get_runtime().get_client('bedrock')
 
 
-# Default embedding dimensions for models
+# Default embedding output dimensions for known Bedrock embedding models.
+# Used by embed()'s conditional_return_type to set the correct array shape at schema time.
 _embedding_dimensions: dict[str, int] = {
     'amazon.titan-embed-text-v1': 1536,
     'amazon.titan-embed-text-v2:0': 1024,
@@ -239,6 +251,8 @@ async def embed(text: str, *, model_id: str, dimensions: int | None = None) -> p
     """
     from botocore.exceptions import ClientError
 
+    # Build the request body differently for Nova vs Titan models,
+    # as they use different JSON structures for embedding requests.
     body: dict[str, Any]
     if 'nova' in model_id:
         body = {
@@ -275,6 +289,9 @@ async def embed(text: str, *, model_id: str, dimensions: int | None = None) -> p
         raise pxt.Error(f'Failed to generate embedding: {e}') from e
 
 
+# Image embedding overload: same function name, but accepts PIL Images instead of text.
+# Uses Pixeltable's overload mechanism so that embed() dispatches to the correct
+# implementation based on the input column type (str vs Image).
 @embed.overload
 async def _(image: PIL.Image.Image, *, model_id: str, dimensions: int | None = None) -> pxt.Array[(None,), np.float32]:
     from botocore.exceptions import ClientError
@@ -312,6 +329,9 @@ async def _(image: PIL.Image.Image, *, model_id: str, dimensions: int | None = N
         raise pxt.Error(f'Failed to generate embedding: {e}') from e
 
 
+# conditional_return_type lets Pixeltable determine the exact output array shape
+# at schema definition time based on the model_id and dimensions parameters,
+# rather than returning a generic (None,) shape.
 @embed.conditional_return_type
 def _(*, model_id: str, dimensions: int | None = None) -> ts.ArrayType:
     if dimensions is not None:
@@ -328,6 +348,11 @@ def invoke_tools(tools: Tools, response: exprs.Expr) -> exprs.InlineDict:
 
 @pxt.udf
 def _bedrock_response_to_pxt_tool_calls(response: dict) -> dict | None:
+    """Internal UDF that extracts tool calls from a Bedrock Converse response.
+
+    Bedrock returns tool invocations under response['output']['message']['content']
+    as dicts with a 'toolUse' key. This converts them to Pixeltable's normalized format.
+    """
     if response.get('stopReason') != 'tool_use':
         return None
 

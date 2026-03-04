@@ -1,3 +1,24 @@
+"""
+Table - The primary user-facing handle for interacting with Pixeltable tables and views.
+
+Table is an abstract base class that provides the query interface (select, where, order_by,
+group_by, join, etc.) as well as schema management operations (add_column, add_computed_column,
+drop_column, add_embedding_index, etc.).
+
+Table acts as a thin wrapper around a TableVersionPath, delegating to the Query system for
+data retrieval and to TableVersion for schema mutations.
+
+Class hierarchy:
+    SchemaObject
+        Table (query interface + schema ops)
+            InsertableTable (adds insert/delete for base tables)
+            View (virtual table: views, snapshots, component views)
+
+Key design pattern: Table holds a TableVersionPath (not a TableVersion directly).
+This ensures safe cross-transaction usage, since TableVersion instances are invalidated
+at transaction boundaries but handles/paths remain valid.
+"""
+
 from __future__ import annotations
 
 import abc

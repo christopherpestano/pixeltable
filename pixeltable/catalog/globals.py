@@ -1,3 +1,15 @@
+"""
+Globals - Shared constants, enums, and utility functions for the catalog module.
+
+Contains:
+- QColumnId: Qualified column identifier (table UUID + column int id)
+- MediaValidation: Enum controlling when media files are validated (on read vs. write)
+- IfExistsParam / IfNotExistsParam: Enums for idempotent schema operations
+- is_valid_identifier: Validates Python-identifier-style names for tables/columns
+- is_system_column_name: Checks if a name conflicts with built-in Table/View methods
+- Reserved column names (_POS_COLUMN_NAME, _ROWID_COLUMN_NAME)
+"""
+
 from __future__ import annotations
 
 import enum
@@ -28,6 +40,12 @@ class QColumnId:
 
 
 class MediaValidation(enum.Enum):
+    """Controls when media file integrity is checked.
+
+    ON_READ: Validate media when data is queried (lazy, avoids insert-time overhead).
+    ON_WRITE: Validate media at insert time (eager, catches errors early).
+    """
+
     ON_READ = 0
     ON_WRITE = 1
 
@@ -41,6 +59,14 @@ class MediaValidation(enum.Enum):
 
 
 class IfExistsParam(enum.Enum):
+    """Controls behavior when a schema object already exists at the target path.
+
+    ERROR: Raise an exception (default).
+    IGNORE: Silently do nothing and return the existing object.
+    REPLACE: Drop the existing object and create a new one (if no dependents).
+    REPLACE_FORCE: Like REPLACE but also drops dependents.
+    """
+
     ERROR = 0
     IGNORE = 1
     REPLACE = 2
@@ -56,6 +82,12 @@ class IfExistsParam(enum.Enum):
 
 
 class IfNotExistsParam(enum.Enum):
+    """Controls behavior when the target schema object does not exist.
+
+    ERROR: Raise an exception (default).
+    IGNORE: Silently do nothing.
+    """
+
     ERROR = 0
     IGNORE = 1
 
@@ -78,6 +110,11 @@ def is_valid_identifier(name: str, *, allow_system_identifiers: bool = False, al
 
 
 def is_system_column_name(name: str) -> bool:
+    """Returns True if the name conflicts with built-in Table/View attributes.
+
+    These names are reserved because they would shadow Python methods (e.g., 'select',
+    'insert', 'columns') when accessed via t.name attribute syntax.
+    """
     from pixeltable.catalog import InsertableTable, View
 
     global _PREDEF_SYMBOLS  # noqa: PLW0603

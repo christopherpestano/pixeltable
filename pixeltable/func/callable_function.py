@@ -1,3 +1,23 @@
+"""CallableFunction -- a Pixeltable Function backed by a Python callable.
+
+This module defines ``CallableFunction``, the most common type of Pixeltable function.
+It wraps a Python callable (regular function, lambda, or async coroutine) and provides:
+
+- **Signature inference**: Types are inferred from the callable's type annotations.
+- **Batch execution**: If ``batch_size`` is set, the function processes multiple rows at
+  once. Batched parameters receive lists; constant parameters receive scalars.
+- **Async support**: Coroutine functions are detected and executed via the runtime event loop.
+- **Serialization**: Module-level functions are serialized by path reference. Locally-defined
+  functions (lambdas, notebook functions) are serialized via cloudpickle to the database.
+- **Overloading**: Multiple signatures can be added via the ``.overload()`` method.
+
+Serialization modes:
+    1. Module functions: Stored by fully-qualified path (e.g. 'mymodule.my_fn').
+       On load, the symbol is re-imported.
+    2. Local functions: Stored by UUID in the database, with the callable pickled
+       via cloudpickle and persisted as a binary blob.
+"""
+
 from __future__ import annotations
 
 import inspect
@@ -20,8 +40,18 @@ class CallableFunction(Function):
     """Pixeltable Function backed by a Python Callable.
 
     CallableFunctions come in two flavors:
-    - references to lambdas and functions defined in notebooks, which are pickled and serialized to the store
-    - functions that are defined in modules are serialized via the default mechanism
+    - **Module functions**: Defined in importable Python modules and serialized by their
+      fully-qualified path (e.g. 'pixeltable.functions.openai.chat_completions'). On
+      deserialization, the symbol is re-imported.
+    - **Stored functions**: Defined in notebooks or lambdas, pickled via cloudpickle and
+      stored in the database. Identified by UUID.
+
+    Attributes:
+        py_fns: The Python callables backing each signature (one per overload).
+            For non-polymorphic functions, this is a single-element list.
+        self_name: The display name of the function (used in error messages and repr).
+        batch_size: If set, the function operates in batch mode. The execution engine
+            will group rows into batches of this size and pass lists to batched parameters.
     """
 
     py_fns: list[Callable]
@@ -56,11 +86,13 @@ class CallableFunction(Function):
         )
 
     def _update_as_overload_resolution(self, signature_idx: int) -> None:
+        """When resolving to a specific overload, retain only the matching callable."""
         assert len(self.py_fns) > signature_idx
         self.py_fns = [self.py_fns[signature_idx]]
 
     @property
     def is_batched(self) -> bool:
+        """True if this function operates on batches of rows."""
         return self.batch_size is not None
 
     @property
@@ -72,10 +104,16 @@ class CallableFunction(Function):
 
     @property
     def py_fn(self) -> Callable:
+        """The single Python callable for a non-polymorphic function."""
         assert not self.is_polymorphic
         return self.py_fns[0]
 
     async def aexec(self, *args: Any, **kwargs: Any) -> Any:
+        """Asynchronously execute this function for a single row.
+
+        For batched functions, wraps the single-row args into singleton lists,
+        calls the batch function, and extracts the single result.
+        """
         assert not self.is_polymorphic
         assert self.is_async
         if self.is_batched:
@@ -91,6 +129,11 @@ class CallableFunction(Function):
             return await self.py_fn(*args, **kwargs)
 
     def exec(self, args: Sequence[Any], kwargs: dict[str, Any]) -> Any:
+        """Synchronously execute this function for a single row.
+
+        For batched functions, wraps args into singleton lists and extracts the single result.
+        For async functions, runs the coroutine via the runtime event loop.
+        """
         assert not self.is_polymorphic
         if self.is_batched:
             # Pack the batched parameters into singleton lists
@@ -137,7 +180,15 @@ class CallableFunction(Function):
         return self.py_fn(*args, **constant_kwargs, **batched_kwargs)
 
     def create_batch_kwargs(self, kwargs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, list[Any]]]:
-        """Converts kwargs containing lists into constant and batched kwargs in the format expected by a batched udf."""
+        """Split kwargs into constant (scalar) and batched (list) kwargs.
+
+        During batch execution, all kwargs arrive as lists. Constant parameters
+        have uniform values across the batch, so we extract the first element.
+        Batched parameters are passed through as-is.
+
+        Returns:
+            A tuple (constant_kwargs, batched_kwargs).
+        """
         constant_param_names = [p.name for p in self.signature.constant_parameters]
         constant_kwargs = {k: v[0] for k, v in kwargs.items() if k in constant_param_names}
         batched_kwargs = {k: v for k, v in kwargs.items() if k not in constant_param_names}
@@ -155,6 +206,21 @@ class CallableFunction(Function):
         return self.self_name
 
     def overload(self, fn: Callable) -> CallableFunction:
+        """Add an overloaded signature backed by a different Python callable.
+
+        This allows a single UDF to accept multiple argument type combinations.
+        The new callable's signature is inferred and appended to the signatures list.
+
+        Args:
+            fn: A Python callable whose type annotations define the new overload.
+
+        Returns:
+            self (for decorator chaining).
+
+        Raises:
+            excs.Error: If the function is locally defined, uses is_method/is_property,
+                has already been called, or has a conditional return type.
+        """
         if self.self_path is None:
             raise excs.Error('`overload` can only be used with module UDFs (not locally defined UDFs)')
         if self.is_method or self.is_property:
@@ -187,12 +253,18 @@ class CallableFunction(Function):
         return super()._from_dict(d)
 
     def to_store(self) -> tuple[dict, bytes]:
+        """Serialize this function for database storage.
+
+        Returns a metadata dict and a cloudpickle-serialized binary blob of the callable.
+        Only supported for non-polymorphic stored functions (not module-level UDFs).
+        """
         assert not self.is_polymorphic  # multi-signature UDFs not allowed for stored fns
         md = {'signature': self.signature.as_dict(), 'batch_size': self.batch_size}
         return md, cloudpickle.dumps(self.py_fn)
 
     @classmethod
     def from_store(cls, name: str | None, md: dict, binary_obj: bytes) -> Function:
+        """Reconstruct a CallableFunction from its database-stored representation."""
         py_fn = cloudpickle.loads(binary_obj)
         assert callable(py_fn)
         sig = Signature.from_dict(md['signature'])

@@ -1,8 +1,15 @@
 """
-Pixeltable UDFs
-that wrap various endpoints from the fal.ai API. In order to use them, you must
-first `pip install fal-client` and configure your fal.ai credentials, as described in
-the [Working with fal.ai](https://docs.pixeltable.com/notebooks/integrations/working-with-fal) tutorial.
+Pixeltable UDFs that wrap the fal.ai model execution API.
+
+fal.ai hosts a variety of generative AI models (image generation, video, audio, etc.)
+accessible through a unified ``run`` / ``subscribe`` interface. This module provides a single
+generic ``run`` UDF that can invoke any fal.ai application by name.
+
+In order to use it, you must first ``pip install fal-client`` and configure your fal.ai
+credentials, as described in the
+[Working with fal.ai](https://docs.pixeltable.com/notebooks/integrations/working-with-fal) tutorial.
+
+Environment variable: ``FAL_KEY``
 """
 
 from typing import TYPE_CHECKING, Any
@@ -16,6 +23,7 @@ if TYPE_CHECKING:
     import fal_client
 
 
+# Register the fal.ai async client factory. Uses fal_client.AsyncClient for async execution.
 @register_client('fal')
 def _(api_key: str) -> 'fal_client.AsyncClient':
     import fal_client

@@ -1,3 +1,24 @@
+"""Function signature representation and type inference.
+
+This module defines the ``Signature`` and ``Parameter`` classes, which represent
+the typed signatures of Pixeltable functions. Signatures are inferred from Python
+type hints and are used for:
+
+- Argument validation during function calls
+- Type checking (ensuring argument types match parameter types)
+- Serialization/deserialization (signatures are persisted alongside computed columns)
+- Batch parameter identification (parameters annotated with ``Batch[T]``)
+- Overload resolution (polymorphic functions have multiple signatures)
+
+The ``Batch`` type alias (``Batch[T] = Annotated[list[T], 'pxt-batch']``) is used
+to mark parameters and return types that operate on batches of values rather than
+individual scalars. This enables efficient vectorized execution.
+
+Key classes:
+    Parameter: A single typed parameter with name, kind, type, default, and batch flag.
+    Signature: A complete function signature with return type, parameters, and batch info.
+"""
+
 from __future__ import annotations
 
 import dataclasses
@@ -17,6 +38,20 @@ _logger = logging.getLogger('pixeltable')
 
 @dataclasses.dataclass
 class Parameter:
+    """Represents a single typed parameter of a Pixeltable function signature.
+
+    Attributes:
+        name: The parameter name as it appears in the Python function signature.
+        col_type: The Pixeltable ColumnType for this parameter. None for VAR_POSITIONAL
+            or VAR_KEYWORD parameters (``*args`` / ``**kwargs``).
+        kind: The parameter kind (POSITIONAL_ONLY, POSITIONAL_OR_KEYWORD, etc.),
+            matching ``inspect.Parameter`` kinds.
+        default: An optional default value, stored as a ``Literal`` expression. None means
+            the parameter is required.
+        is_batched: True if the parameter was annotated with ``Batch[T]``, meaning it
+            receives a list of values during batched execution.
+    """
+
     name: str
     col_type: ts.ColumnType | None  # None for variable parameters
     kind: inspect._ParameterKind
@@ -39,9 +74,11 @@ class Parameter:
                 )
 
     def has_default(self) -> bool:
+        """Return True if this parameter has a default value."""
         return self.default is not None
 
     def as_dict(self) -> dict[str, Any]:
+        """Serialize this parameter to a JSON-compatible dict for persistence."""
         return {
             'name': self.name,
             'col_type': self.col_type.as_dict() if self.col_type is not None else None,
@@ -52,6 +89,7 @@ class Parameter:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Parameter:
+        """Deserialize a Parameter from a dict produced by ``as_dict()``."""
         from pixeltable import exprs
 
         assert d['default'] is None or isinstance(d['default'], dict), d
@@ -65,6 +103,7 @@ class Parameter:
         )
 
     def to_py_param(self) -> inspect.Parameter:
+        """Convert this Parameter to an ``inspect.Parameter`` for use in Python signature objects."""
         py_default = self.default.val if self.default is not None else inspect.Parameter.empty
         return inspect.Parameter(self.name, self.kind, default=py_default)
 
@@ -77,10 +116,36 @@ Batch = typing.Annotated[list[T], 'pxt-batch']
 
 
 class Signature:
-    """
-    Represents the signature of a Pixeltable function.
+    """Represents the typed signature of a Pixeltable function.
 
-    - self.is_batched: return type is a Batch[...] type
+    A Signature captures the return type, parameter list (with types and defaults),
+    and batching information for a single overload of a Pixeltable function. It is the
+    central type-checking mechanism: when a function is called, argument types are validated
+    against the Signature's parameter types.
+
+    For polymorphic functions (multiple overloads), each overload has its own Signature.
+    The function tries each Signature in declaration order until one matches.
+
+    Attributes:
+        return_type: The Pixeltable ColumnType returned by the function.
+        is_batched: True if the return type was declared as ``Batch[T]``, indicating
+            the function processes batches of inputs and returns a list of outputs.
+        parameters: Ordered dict mapping parameter name to Parameter.
+        parameters_by_pos: Parameters in positional order.
+        constant_parameters: Parameters that are NOT batched (receive scalar values
+            even during batch execution).
+        batched_parameters: Parameters annotated with ``Batch[T]`` (receive lists
+            during batch execution).
+        required_parameters: Parameters without default values.
+        system_parameters: Names of recognized internal parameters (e.g. '_runtime_ctx')
+            that are excluded from the public signature.
+        py_signature: A standard ``inspect.Signature`` mirror used for argument binding.
+
+    Class attributes:
+        SPECIAL_PARAM_NAMES: Reserved names ('group_by', 'order_by') that cannot be
+            used as UDF parameter names because they have special semantics in aggregates.
+        SYSTEM_PARAM_NAMES: Internal parameter names (e.g. '_runtime_ctx') that are
+            silently stripped from the user-visible signature.
     """
 
     SPECIAL_PARAM_NAMES: ClassVar[list[str]] = ['group_by', 'order_by']
@@ -119,10 +184,12 @@ class Signature:
         self.py_signature = inspect.Signature([p.to_py_param() for p in self.parameters_by_pos])
 
     def get_return_type(self) -> ts.ColumnType:
+        """Return the ColumnType of this signature's return value."""
         assert isinstance(self.return_type, ts.ColumnType)
         return self.return_type
 
     def as_dict(self) -> dict[str, Any]:
+        """Serialize this signature to a JSON-compatible dict for persistence."""
         result = {
             'return_type': self.get_return_type().as_dict(),
             'parameters': [p.as_dict() for p in self.parameters.values()],
@@ -132,6 +199,7 @@ class Signature:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Signature:
+        """Deserialize a Signature from a dict produced by ``as_dict()``."""
         parameters = [Parameter.from_dict(param_dict) for param_dict in d['parameters']]
         return cls(ts.ColumnType.from_dict(d['return_type']), parameters, d['is_batched'])
 
@@ -173,6 +241,19 @@ class Signature:
         return True
 
     def validate_args(self, bound_args: dict[str, 'exprs.Expr' | None], context: str = '') -> None:
+        """Validate that bound arguments are type-compatible with this signature's parameters.
+
+        For each argument, checks that the argument's ColumnType is compatible with the
+        parameter's declared ColumnType (allowing nullable arguments to non-nullable params,
+        since FunctionCall.eval() handles None-skipping).
+
+        Args:
+            bound_args: Mapping from parameter names to bound Expr arguments.
+            context: Optional context string for error messages (e.g. 'in function my_fn').
+
+        Raises:
+            excs.Error: If any argument type is incompatible with its parameter type.
+        """
         if context:
             context = f' ({context})'
 
@@ -232,7 +313,18 @@ class Signature:
 
     @classmethod
     def _infer_type(cls, annotation: type | None) -> tuple[ts.ColumnType | None, bool | None]:
-        """Returns: (column type, is_batched) or (None, ...) if the type cannot be inferred"""
+        """Infer a Pixeltable ColumnType from a Python type annotation.
+
+        Handles the ``Batch[T]`` annotation (``Annotated[list[T], 'pxt-batch']``) by
+        unwrapping it to extract the inner type and setting is_batched=True.
+
+        Args:
+            annotation: A Python type annotation, or None.
+
+        Returns:
+            A tuple of (column_type, is_batched). column_type is None if the type
+            cannot be mapped to a Pixeltable type.
+        """
         if annotation is None:
             return (None, None)
         py_type: type | None = None
@@ -258,7 +350,30 @@ class Signature:
         type_substitutions: dict | None = None,
         is_cls_method: bool = False,
     ) -> list[Parameter]:
-        """Ignores parameters starting with '_'."""
+        """Create a list of Parameter objects from a Python function or parameter list.
+
+        Processes each Python parameter to determine its Pixeltable type, either from
+        explicit ``param_types``, from type annotations (with optional ``type_substitutions``),
+        or from the ``Batch[T]`` annotation for batched parameters.
+
+        Skips parameters starting with '_' (reserved), system parameters, and the first
+        parameter of class methods (self/cls).
+
+        Args:
+            py_fn: The Python callable to inspect. Mutually exclusive with ``py_params``.
+            py_params: An explicit list of ``inspect.Parameter`` objects. Mutually exclusive
+                with ``py_fn``.
+            param_types: Optional explicit ColumnType list (one per parameter).
+            type_substitutions: Optional mapping from annotation types to replacement types,
+                used for polymorphic overloads (e.g. {T: int} substitutes generic T with int).
+            is_cls_method: If True, skip the first parameter (self/cls).
+
+        Returns:
+            A list of Parameter objects with inferred types.
+
+        Raises:
+            excs.Error: If a parameter type cannot be inferred or names are reserved.
+        """
         from pixeltable import exprs
 
         assert (py_fn is None) != (py_params is None)
@@ -315,9 +430,24 @@ class Signature:
         type_substitutions: dict | None = None,
         is_cls_method: bool = False,
     ) -> Signature:
-        """Create a signature for the given Callable.
-        Infer the parameter and return types, if none are specified.
-        Raises an exception if the types cannot be inferred.
+        """Create a Signature by inspecting a Python callable's type annotations.
+
+        Infers parameter types and return type from Python type hints, with optional
+        explicit overrides. Handles ``Batch[T]`` annotations for batched parameters
+        and return types, and filters out system parameters.
+
+        Args:
+            py_fn: The Python callable to inspect.
+            param_types: Optional explicit parameter types (overrides annotation inference).
+            return_type: Optional explicit return type (overrides annotation inference).
+            type_substitutions: Optional mapping for polymorphic type substitution.
+            is_cls_method: If True, skip the first parameter (self/cls).
+
+        Returns:
+            A fully constructed Signature.
+
+        Raises:
+            excs.Error: If parameter or return types cannot be inferred.
         """
         if type_substitutions is None:
             type_substitutions = {}

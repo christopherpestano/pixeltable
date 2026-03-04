@@ -1,3 +1,35 @@
+"""Iterator infrastructure -- table-generating functions for views.
+
+This module implements Pixeltable's iterator system, which enables one-to-many
+row expansion for creating views. Iterators are the mechanism behind operations
+like document chunking, video frame extraction, and other data expansion patterns.
+
+Architecture:
+    - ``PxtIterator[T]``: Abstract base class that users subclass. Implements the
+      Python iterator protocol (__next__) and optional seek() for resumable iteration.
+    - ``GeneratingFunction``: Wraps a PxtIterator class (or a generator function that
+      returns ``Iterator[dict]``) and makes it callable as a Pixeltable function. It is
+      the equivalent of a SQL table-generating function.
+    - ``GeneratingFunctionCall``: A frozen dataclass representing a specific call to a
+      GeneratingFunction with bound arguments. Captures the iterator, args, outputs,
+      and any validation errors.
+    - ``IteratorOutput``: Metadata for a single output column of an iterator, including
+      its name, type, and whether it is stored.
+    - ``InvalidGeneratingFunction``: Placeholder for iterators that cannot be resolved
+      (analogous to InvalidFunction).
+    - The ``@pxt.iterator`` decorator creates a GeneratingFunction from a class or function.
+
+Output schema:
+    The output schema (column names and types) is inferred from the ``__next__()``
+    return type annotation (must be a ``TypedDict``) or from a
+    ``conditional_output_schema()`` classmethod. A hidden ``pos`` column is always
+    added to track row position within each iteration group.
+
+Validation:
+    Iterators can define a ``validate()`` classmethod (or use the ``.validate`` decorator)
+    to perform custom validation of arguments at call time.
+"""
+
 import abc
 import collections.abc
 import inspect
@@ -27,6 +59,15 @@ T = TypeVar('T')
 
 @dataclass(frozen=True)
 class IteratorOutput:
+    """Metadata describing a single output column of an iterator.
+
+    Attributes:
+        orig_name: The original column name as declared in the output schema.
+        is_stored: Whether this column is persisted (False for the implicit ``pos``
+            column and columns listed in ``unstored_cols``).
+        col_type: The Pixeltable ColumnType of this output column.
+    """
+
     orig_name: str
     is_stored: bool
     col_type: ts.ColumnType
@@ -44,6 +85,21 @@ class IteratorOutput:
 
 
 class PxtIterator(abc.ABC, Iterator[T], Generic[T]):
+    """Abstract base class for user-defined Pixeltable iterators.
+
+    Subclasses implement the Python iterator protocol to expand a single input
+    row into multiple output rows. Each call to ``__next__()`` returns a dict
+    whose keys match the output schema (defined via TypedDict return annotation
+    or ``conditional_output_schema``).
+
+    Optional methods:
+        - ``close()``: Cleanup when iteration is done.
+        - ``seek(pos)``: Jump to a specific position (required if ``unstored_cols`` is used).
+        - ``validate(bound_args)``: Classmethod for custom argument validation.
+        - ``conditional_output_schema(bound_args)``: Classmethod returning a dynamic
+          output schema based on the bound arguments.
+    """
+
     def __iter__(self) -> Self:
         return self
 
@@ -107,6 +163,14 @@ class GeneratingFunction:
         self.is_legacy_retrofit = False
 
     def _infer_properties(self) -> None:
+        """Inspect the decorated callable to determine output schema, seek support, and validators.
+
+        Handles two cases:
+        1. A PxtIterator subclass: inspects __next__ return type, checks for seek(),
+           validate(), and conditional_output_schema() methods.
+        2. A generator function returning Iterator[dict]: inspects the return type annotation
+           to determine the output TypedDict.
+        """
         self.py_sig = inspect.signature(self.decorated_callable)
         output_schema_type: type[dict]
         iter_fn: Callable
@@ -199,6 +263,18 @@ class GeneratingFunction:
             self._default_output_schema[name] = col_type
 
     def call_output_schema(self, bound_kwargs: dict[str, Any]) -> dict[str, ts.ColumnType]:
+        """Determine the output column schema for a specific call.
+
+        If a conditional_output_schema is defined, calls it with the bound kwargs
+        to get a dynamic schema. Otherwise, uses the statically-inferred default
+        output schema from the TypedDict annotation.
+
+        Args:
+            bound_kwargs: Literal argument values bound at call time.
+
+        Returns:
+            A dict mapping output column name -> ColumnType.
+        """
         if self._conditional_output_schema is None:
             if self._default_output_schema is None:
                 raise excs.Error(
@@ -318,6 +394,17 @@ class GeneratingFunction:
 
 
 class InvalidGeneratingFunction(GeneratingFunction):
+    """Placeholder for an iterator that could not be resolved during deserialization.
+
+    Analogous to InvalidFunction, this allows views that reference broken iterators
+    to be partially loaded. Any attempt to call the iterator raises an error.
+
+    Attributes:
+        fqn: The fully-qualified name of the original iterator.
+        fn_dict: The original serialized metadata, preserved for re-serialization.
+        error_msg: Human-readable explanation of why the iterator could not be loaded.
+    """
+
     fqn: str
     fn_dict: dict[str, Any]
     error_msg: str
@@ -345,6 +432,24 @@ class InvalidGeneratingFunction(GeneratingFunction):
 
 @dataclass(frozen=True)
 class GeneratingFunctionCall:
+    """Represents a specific invocation of a GeneratingFunction with bound arguments.
+
+    This is created by calling a GeneratingFunction and captures all the information
+    needed to execute the iterator and create the view columns. It is persisted as
+    part of view metadata.
+
+    Attributes:
+        it: The GeneratingFunction being called.
+        args: Positional argument expressions.
+        kwargs: Keyword argument expressions.
+        bound_args: All arguments bound to their parameter names.
+        outputs: Mapping from output column name -> IteratorOutput metadata,
+            including the implicit ``pos`` column.
+        validation_error: If not None, indicates a problem detected during
+            deserialization (e.g. signature mismatch). The view is considered
+            invalid but can still be loaded.
+    """
+
     it: GeneratingFunction
     args: list['exprs.Expr']
     kwargs: dict[str, 'exprs.Expr']

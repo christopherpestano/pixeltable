@@ -1,3 +1,21 @@
+"""FunctionRegistry -- central registry for all Pixeltable functions.
+
+This module implements the singleton ``FunctionRegistry`` that serves as the global
+catalog of all registered functions. It handles:
+
+- **Module function registration**: When a ``@pxt.udf`` decorator runs in a module,
+  the resulting CallableFunction is registered here by its fully-qualified path.
+- **Type method registration**: Functions declared with ``is_method=True`` or
+  ``is_property=True`` are also indexed by their base type, enabling method-style
+  access on column expressions (e.g. ``t.text.upper()``).
+- **Stored function management**: Functions defined in notebooks/lambdas are stored
+  in the database via ``create_stored_function`` and retrieved on demand via
+  ``get_stored_function``.
+- **Function listing**: ``list_functions()`` returns all registered module functions.
+
+The registry is a singleton accessed via ``FunctionRegistry.get()``.
+"""
+
 from __future__ import annotations
 
 import dataclasses
@@ -17,15 +35,23 @@ _logger = logging.getLogger('pixeltable')
 
 
 class FunctionRegistry:
-    """
-    A central registry for all Functions. Handles interactions with the backing store.
-    Function are loaded from the store on demand.
+    """Central registry for all Pixeltable Functions.
+
+    Maintains three indexes:
+    - ``module_fns``: Maps fully-qualified path -> Function for all module-level UDFs.
+    - ``stored_fns_by_id``: Cache of UUID -> Function for database-stored functions.
+    - ``type_methods``: Maps (ColumnType.Type, method_name) -> Function for type methods.
+
+    The registry is a process-global singleton. Functions are registered during module
+    import (when decorators like ``@pxt.udf`` execute). Stored functions are loaded
+    lazily from the database on first access.
     """
 
     _instance: FunctionRegistry | None = None
 
     @classmethod
     def get(cls) -> FunctionRegistry:
+        """Return the singleton FunctionRegistry instance, creating it if needed."""
         if cls._instance is None:
             cls._instance = FunctionRegistry()
         return cls._instance
@@ -64,6 +90,19 @@ class FunctionRegistry:
     #             self.module_fns[fn_path] = obj
 
     def register_function(self, fqn: str, fn: Function) -> None:
+        """Register a module-level function by its fully-qualified name.
+
+        Also registers type methods/properties by indexing them under their
+        base type for method-style dispatch.
+
+        Args:
+            fqn: Fully-qualified name (e.g. 'pixeltable.functions.openai.chat_completions').
+            fn: The Function instance to register.
+
+        Raises:
+            excs.Error: If a function with the same fqn is already registered,
+                or if a duplicate type method name is detected.
+        """
         if fqn in self.module_fns:
             raise excs.Error(f'A UDF with that name already exists: {fqn}')
         self.module_fns[fqn] = fn
@@ -152,6 +191,18 @@ class FunctionRegistry:
 
     # def create_function(self, md: schema.FunctionMd, binary_obj: bytes, dir_id: UUID | None = None) -> UUID:
     def create_stored_function(self, pxt_fn: Function, dir_id: UUID | None = None) -> UUID:
+        """Persist a locally-defined function to the database and return its UUID.
+
+        Serializes the function via ``to_store()`` (which cloudpickles the callable),
+        inserts it into the Function table, and caches it locally.
+
+        Args:
+            pxt_fn: The Function to store (typically a CallableFunction from a notebook).
+            dir_id: Optional directory UUID for organizing stored functions.
+
+        Returns:
+            The UUID assigned to the stored function.
+        """
         fn_md, binary_obj = pxt_fn.to_store()
         md = schema.FunctionMd(name=pxt_fn.name, md=fn_md, py_version=sys.version, class_name=pxt_fn.__class__.__name__)
         with env.Env.get().engine.begin() as conn:
@@ -166,6 +217,21 @@ class FunctionRegistry:
             return id
 
     def get_stored_function(self, id: UUID) -> Function:
+        """Retrieve a stored function by UUID, loading from the database if not cached.
+
+        On cache miss, deserializes the function from its database record. If
+        deserialization fails (e.g. due to environment changes), returns an
+        InvalidFunction placeholder.
+
+        Args:
+            id: The UUID of the stored function.
+
+        Returns:
+            The Function instance, or an InvalidFunction if deserialization failed.
+
+        Raises:
+            excs.Error: If no function with the given UUID exists in the database.
+        """
         if id in self.stored_fns_by_id:
             return self.stored_fns_by_id[id]
         stmt = sql.select(schema.Function.md, schema.Function.binary_obj, schema.Function.dir_id).where(
@@ -247,6 +313,7 @@ class FunctionRegistry:
     #             self.stored_fns_by_id[id].value_fn = new_fn.value_fn
 
     def delete_function(self, id: UUID) -> None:
+        """Delete a stored function from the database by UUID."""
         assert id is not None
         with env.Env.get().engine.begin() as conn:
             conn.execute(sql.delete(schema.Function.__table__).where(schema.Function.id == id))

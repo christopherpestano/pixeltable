@@ -1,3 +1,22 @@
+"""
+TableVersionPath - A linked list of TableVersionHandles from a view to its root base.
+
+For a base table, the path is a single element. For a view, the path includes the
+view's own TableVersionHandle plus the entire chain of base table versions. This
+chain is essential for:
+
+- Query execution: Joins between a view's store table and its bases
+- Column resolution: Looking up columns that may be defined in base tables
+- Metadata access: Providing schema info that spans the view hierarchy
+
+The path uses TableVersionHandles (not raw TableVersions) so it remains valid
+across transactions. It also caches a TableVersion instance for fast metadata
+access outside of transactions.
+
+Example path for a view V of table T:
+    V_handle -> T_handle -> None (base)
+"""
+
 from __future__ import annotations
 
 import copy

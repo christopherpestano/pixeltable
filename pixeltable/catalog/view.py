@@ -1,3 +1,25 @@
+"""
+View - A virtual table that presents a filtered, transformed, or iterated view of a base table.
+
+Views are the primary mechanism for creating derived datasets in Pixeltable. They support:
+
+- **Filtered views**: Rows matching a predicate (WHERE clause)
+- **Sampled views**: Random or stratified sampling of base rows
+- **Component views**: Iterator-based expansion (e.g., document chunking, video frames)
+- **Snapshots**: Immutable, versioned references to a base table's state at a point in time
+- **Additional columns**: Computed columns specific to the view
+
+Views are backed by their own store table (joined to the base at query time), except
+for "pure snapshots" which have no additional columns/filter and are just version pointers.
+
+View creation flow:
+1. _create() validates columns, predicates, and iterator config
+2. Metadata is written as PendingTableOps (CreateTableMdOp, CreateStoreTableOp, LoadViewOp)
+3. The Catalog finalizes ops: creates the store table, then loads matching base rows
+
+Views cannot be directly inserted into or deleted from (use the base table instead).
+"""
+
 from __future__ import annotations
 
 import dataclasses

@@ -1,3 +1,14 @@
+"""
+Table Metadata - TypedDict definitions for the public metadata API.
+
+These TypedDicts define the shape of metadata returned by Table.get_metadata(),
+which exposes table/column/index information to users in a structured, documented format.
+
+These are pure data containers with no behavior - they describe what the user
+sees when inspecting a table's properties, distinct from the internal schema.TableMd
+records used for persistence.
+"""
+
 import datetime
 from typing import Any, Literal, TypedDict
 

@@ -1,3 +1,17 @@
+"""
+Path - Represents a dot-separated or slash-separated path to a catalog object.
+
+Paths are used to address tables, views, and directories in the Pixeltable namespace.
+Examples: 'my_dir.my_table', 'my_dir/my_table', 'my_table:3' (versioned).
+
+A Path is an immutable NamedTuple of:
+- components: tuple of path segments (e.g., ('my_dir', 'my_table'))
+- version: optional integer version suffix (e.g., 3 for 'my_table:3')
+
+The root path has components=('',) and represents the user's root directory.
+Paths support parent/append/ancestor operations for navigating the hierarchy.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -11,6 +25,13 @@ _logger = logging.getLogger('pixeltable')
 
 
 class Path(NamedTuple):
+    """An immutable, parsed representation of a catalog object path.
+
+    Supports both dot notation ('dir.table') and slash notation ('dir/table'),
+    plus optional version suffixes ('table:3'). Used throughout the catalog
+    for resolving schema objects by name.
+    """
+
     components: tuple[str, ...]
     version: int | None = None
 

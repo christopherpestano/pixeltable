@@ -1,3 +1,17 @@
+"""
+TableVersionHandle / ColumnHandle - Lazy indirection to TableVersion and Column.
+
+These handle classes solve the problem of holding references to TableVersion instances
+across transaction boundaries. Since TableVersion instances are invalidated at the end
+of each transaction, code that needs to reference a table version (e.g., Column.tbl_handle,
+expressions stored in computed column definitions) uses handles instead.
+
+TableVersionHandle.get() resolves to a validated TableVersion via the Catalog cache,
+ensuring that the caller always gets a fresh, consistent instance.
+
+ColumnHandle works similarly, resolving to a specific Column within a TableVersion.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -85,10 +99,17 @@ class TableVersionHandle:
 
 @dataclass(frozen=True)
 class ColumnHandle:
+    """Lazy reference to a Column within a specific TableVersion.
+
+    Used by expressions (ColumnRef) to reference columns without holding
+    a direct reference to a TableVersion instance.
+    """
+
     tbl_version: TableVersionHandle
     col_id: int
 
     def get(self) -> 'Column':
+        """Resolve this handle to the Column instance, raising Error if the column was dropped."""
         if self.col_id not in self.tbl_version.get().cols_by_id:
             schema_version_drop = self.tbl_version.get()._tbl_md.column_md[self.col_id].schema_version_drop
             raise excs.Error(

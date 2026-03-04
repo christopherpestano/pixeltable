@@ -1,7 +1,26 @@
-# This file contains all dataclasses related to schema.PendingTableOp:
-# - TableOp: the container for each log entry
-# - <>Op: the actual operation; each <>Op class contains enough information to exec/undo itself given a
-#   TableVersion instance
+"""
+Table Operations - Crash-recoverable operation log for schema/data mutations.
+
+This module implements the "pending table ops" mechanism that provides crash recovery
+for multi-step table mutations (create table, add column, create view, drop table, etc.).
+
+How it works:
+1. A mutation writes an ordered list of TableOps to the PendingTableOp table in a single
+   transaction, along with setting the table state to ROLLFORWARD.
+2. The Catalog then executes each op in sequence, marking them COMPLETED.
+3. If all ops succeed, the ops are deleted and the table state returns to LIVE.
+4. If an op fails and the statement is abortable, the table state switches to ROLLBACK,
+   and completed ops are undone in reverse order.
+
+Each TableOp subclass declares:
+- needs_tv: Whether it requires a TableVersion instance to execute
+- needs_xact: Whether it must run inside a transaction (vs. outside for DDL)
+- exec(): Forward execution logic
+- undo(): Reverse execution logic for rollback
+
+This design ensures that even if Pixeltable crashes mid-operation, the next access
+to the table will detect the pending ops and finalize them.
+"""
 
 from __future__ import annotations
 
@@ -26,6 +45,13 @@ _logger = logging.getLogger('pixeltable')
 
 
 class OpStatus(Enum):
+    """Lifecycle state of an individual table operation.
+
+    PENDING: Not yet executed (initial state).
+    COMPLETED: Successfully executed during rollforward.
+    ABORTED: Successfully undone during rollback.
+    """
+
     PENDING = 0
     COMPLETED = 1
     ABORTED = 2
@@ -76,6 +102,12 @@ class TableOp:
 
 @dataclasses.dataclass
 class CreateStoreTableOp(TableOp):
+    """Creates the physical PostgreSQL store table for a new table/view.
+
+    Runs outside a transaction because DDL (CREATE TABLE) auto-commits in PostgreSQL.
+    Undo drops the store table.
+    """
+
     needs_tv: ClassVar[bool] = True
     needs_xact: ClassVar[bool] = False
 
@@ -92,6 +124,12 @@ class CreateStoreTableOp(TableOp):
 
 @dataclasses.dataclass
 class CreateStoreIdxsOp(TableOp):
+    """Creates physical database indices (e.g., B-tree) on the store table.
+
+    Each index is created in its own transaction since DDL is auto-commit.
+    Undo drops each index.
+    """
+
     needs_tv: ClassVar[bool] = True
     needs_xact: ClassVar[bool] = False
 
@@ -112,6 +150,13 @@ class CreateStoreIdxsOp(TableOp):
 
 @dataclasses.dataclass
 class LoadViewOp(TableOp):
+    """Populates a newly created view by executing the view load plan.
+
+    Reads matching rows from the base table and inserts them into the view's store table.
+    Runs inside a transaction because it writes data rows.
+    Undo deletes any media files and clears the file cache.
+    """
+
     needs_tv: ClassVar[bool] = True
     needs_xact: ClassVar[bool] = True
 
@@ -156,6 +201,11 @@ class CreateTableMdOp(TableOp):
 
 @dataclasses.dataclass
 class DeleteTableMdOp(TableOp):
+    """Deletes all metadata records for a table from the catalog store.
+
+    This is the final step of table drop. It cannot be undone (irreversible).
+    """
+
     needs_tv: ClassVar[bool] = False
     needs_xact: ClassVar[bool] = True
 
@@ -169,7 +219,11 @@ class DeleteTableMdOp(TableOp):
 
 @dataclasses.dataclass
 class CreateTableVersionOp(TableOp):
-    """Undo-only log record"""
+    """Undo-only log record for version creation.
+
+    exec() is a no-op because the version metadata was already written in the initial transaction.
+    undo() removes the version metadata to revert the schema change.
+    """
 
     needs_tv: ClassVar[bool] = False
     needs_xact: ClassVar[bool] = True
@@ -184,7 +238,11 @@ class CreateTableVersionOp(TableOp):
 
 @dataclasses.dataclass
 class CreateColumnMdOp(TableOp):
-    """Undo-only log record"""
+    """Undo-only log record for column creation.
+
+    exec() is a no-op because column metadata was written in the initial transaction.
+    undo() removes the column metadata records to revert the add-column operation.
+    """
 
     needs_tv: ClassVar[bool] = True
     needs_xact: ClassVar[bool] = True
@@ -208,6 +266,12 @@ class CreateColumnMdOp(TableOp):
 
 @dataclasses.dataclass
 class CreateStoreColumnsOp(TableOp):
+    """Adds physical columns to the store table via ALTER TABLE.
+
+    Runs outside a transaction because DDL is auto-commit.
+    Each column is added individually with if_not_exists for idempotency.
+    """
+
     needs_tv: ClassVar[bool] = True
     needs_xact: ClassVar[bool] = False
 
@@ -228,6 +292,12 @@ class CreateStoreColumnsOp(TableOp):
 
 @dataclasses.dataclass
 class DeleteTableMediaFilesOp(TableOp):
+    """Deletes all media files (images, audio, etc.) stored for a table.
+
+    This runs outside a transaction and clears both object store files and the local file cache.
+    Cannot be undone (irreversible).
+    """
+
     needs_tv: ClassVar[bool] = True
     needs_xact: ClassVar[bool] = False
 
@@ -243,6 +313,12 @@ class DeleteTableMediaFilesOp(TableOp):
 
 @dataclasses.dataclass
 class DropStoreTableOp(TableOp):
+    """Drops the physical PostgreSQL store table via DROP TABLE IF EXISTS.
+
+    Runs outside a transaction because DDL is auto-commit.
+    Cannot be undone (irreversible).
+    """
+
     needs_tv: ClassVar[bool] = False
     needs_xact: ClassVar[bool] = False
 

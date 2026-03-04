@@ -1,3 +1,26 @@
+"""
+TableVersion - The versioned, physical representation of a table or view.
+
+TableVersion is the core internal class that holds a table's complete state at a
+specific version: columns, indices, metadata, and a reference to the physical
+store table (StoreBase). Every schema or data change bumps the version.
+
+Key responsibilities:
+- Column lifecycle: add, drop, rename columns; manage column metadata
+- Index lifecycle: add, drop embedding/B-tree indices
+- Row operations: insert, update, delete (delegated to StoreBase)
+- Version management: bump_version() creates new version/schema version records
+- View propagation: propagate inserts/updates/deletes to mutable views
+
+TableVersion comes in three flavors (see class docstring for details):
+1. Live (mutable): effective_version=None, anchor_tbl_id=None
+2. Snapshot: effective_version=N (frozen at version N)
+3. Replica: anchor_tbl_id=UUID (anchored to another table's timeline)
+
+IMPORTANT: TableVersion instances must not be stored across transaction boundaries.
+Use TableVersionHandle for persistent references that auto-resolve via the Catalog cache.
+"""
+
 from __future__ import annotations
 
 import copy
@@ -54,8 +77,15 @@ _logger = logging.getLogger('pixeltable')
 
 @dataclasses.dataclass(frozen=True)
 class TableVersionMd:
-    """
-    Complete set of md records for a specific TableVersion instance.
+    """Complete set of metadata records needed to construct a TableVersion.
+
+    Groups together the three metadata records that define a table version:
+    - tbl_md: Table-level metadata (columns, indices, view info, state)
+    - version_md: Per-version metadata (timestamp, user, update counts)
+    - schema_version_md: Per-schema-version metadata (column names/positions, settings)
+
+    This bundle is passed around during table creation and is serialized to/from
+    the PostgreSQL metadata store.
     """
 
     tbl_md: schema.TableMd
@@ -82,6 +112,16 @@ class TableVersionMd:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class TableVersionKey:
+    """Cache key for TableVersion instances in the Catalog.
+
+    A table version is uniquely identified by:
+    - tbl_id: The table's UUID
+    - effective_version: Set for snapshots (frozen at this version); None for live tables
+    - anchor_tbl_id: Set for replicas (anchored to this table's timeline); None otherwise
+
+    At most one of effective_version and anchor_tbl_id can be set.
+    """
+
     tbl_id: UUID
     effective_version: int | None
     anchor_tbl_id: UUID | None

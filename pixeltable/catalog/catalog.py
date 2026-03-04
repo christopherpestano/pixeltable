@@ -1,3 +1,24 @@
+"""
+Catalog - The central registry and coordinator for all Pixeltable schema objects.
+
+This module provides the Catalog class, which is the functional interface for creating,
+loading, updating, and dropping tables, views, and directories. It also implements:
+
+- **Transaction management**: begin_xact() provides transactional access with automatic
+  locking, validation, and retry on serialization conflicts.
+- **Retry logic**: retry_loop() decorator handles optimistic concurrency by retrying
+  operations that fail due to serialization errors or lock contention.
+- **Metadata caching**: Catalog caches TableVersion instances to avoid excessive DB reads,
+  with invalidation at transaction boundaries.
+- **Pending operations**: Table mutations are logged as PendingTableOps and finalized
+  via a rollforward/rollback protocol, enabling crash recovery.
+- **Column dependency tracking**: Tracks which computed columns depend on other columns,
+  enabling correct update propagation across the mutable view tree.
+
+The Catalog is a singleton managed by the Runtime. All operations that access table data
+or metadata must run inside a Catalog transaction (begin_xact or retry_loop).
+"""
+
 from __future__ import annotations
 
 import dataclasses
@@ -47,7 +68,10 @@ _logger = logging.getLogger('pixeltable')
 
 
 def _unpack_row(row: sql.engine.Row | None, entities: list[type[sql.orm.decl_api.DeclarativeBase]]) -> list[Any] | None:
-    """Convert a Row result into a list of entity instances.
+    """Convert a SQLAlchemy Row result into a list of ORM entity instances.
+
+    Used when loading metadata from the catalog store: a single Row may contain columns
+    from multiple ORM entities (e.g., Table + Dir), and this function splits them apart.
 
     Assumes that the query contains a select() of exactly those entities.
     """
@@ -137,6 +161,12 @@ def retry_loop(
 
 
 class PendingTableOpsError(Exception):
+    """Raised when a table has unfinished pending operations that must be finalized first.
+
+    The retry_loop or begin_xact will catch this and call _finalize_pending_ops()
+    before retrying the original operation.
+    """
+
     tbl_id: UUID
 
     def __init__(self, tbl_id: UUID) -> None:

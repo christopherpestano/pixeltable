@@ -1,8 +1,15 @@
 """
-Pixeltable UDFs
-that wrap various endpoints from the Fireworks AI API. In order to use them, you must
-first `pip install fireworks-ai` and configure your Fireworks AI credentials, as described in
-the [Working with Fireworks](https://docs.pixeltable.com/notebooks/integrations/working-with-fireworks) tutorial.
+Pixeltable UDFs that wrap the Fireworks AI chat completions API.
+
+Fireworks AI provides fast inference for open-source models (Mixtral, Llama, etc.).
+This module uses the Fireworks Python SDK's streaming interface and reassembles streamed
+chunks into a single response dict.
+
+In order to use it, you must first ``pip install fireworks-ai`` and configure your Fireworks
+AI credentials, as described in the
+[Working with Fireworks](https://docs.pixeltable.com/notebooks/integrations/working-with-fireworks) tutorial.
+
+Environment variable: ``FIREWORKS_API_KEY``
 """
 
 from typing import TYPE_CHECKING, Any
@@ -73,15 +80,21 @@ async def chat_completions(
     # res_sync = _fireworks_client().chat.completions.create(model=model, messages=messages, **kwargs_not_none)
     # res_sync_dict = res_sync.dict()
 
+    # Set request timeout from config or default to 600s (10 minutes).
     if 'request_timeout' not in model_kwargs:
         model_kwargs['request_timeout'] = Config.get().get_int_value('timeout', section='fireworks') or 600
     # TODO: this timeout doesn't really work, I think it only applies to returning the stream, but not to the timing
     # of the chunks; addressing this would require a timeout for the task running this udf
+
+    # Fireworks uses a streaming API (acreate returns an async iterator of chunks).
+    # We collect all chunks and reassemble them into a single response dict.
     stream = _fireworks_client().chat.completions.acreate(model=model, messages=messages, **model_kwargs)
     chunks = []
     async for chunk in stream:
         chunks.append(chunk)
 
+    # Build the final response dict by merging all streamed chunks.
+    # The first chunk provides id/created/model; subsequent chunks contribute content deltas.
     res = {
         'id': chunks[0].id,
         'object': 'chat.completion',

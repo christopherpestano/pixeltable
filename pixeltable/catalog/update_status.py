@@ -1,3 +1,17 @@
+"""
+UpdateStatus / RowCountStats - Result objects for table mutation operations.
+
+These dataclasses are returned by insert(), delete(), add_column(), and other
+mutation methods to report what happened:
+
+- RowCountStats: Low-level counts (rows inserted, deleted, updated, exceptions)
+- UpdateStatus: Higher-level result combining direct and cascaded row counts,
+  along with column-level exception tracking
+
+UpdateStatus supports addition (+) for combining results from batched operations,
+and provides formatted messages (insert_msg, _repr_pretty_) for user display.
+"""
+
 from __future__ import annotations
 
 import time

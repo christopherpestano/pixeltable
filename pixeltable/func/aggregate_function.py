@@ -1,3 +1,29 @@
+"""AggregateFunction and Aggregator -- infrastructure for user-defined aggregate functions.
+
+This module implements Pixeltable's aggregate function system, analogous to SQL
+aggregate functions (SUM, COUNT, etc.) but extensible via Python classes.
+
+Architecture:
+    - ``Aggregator`` is the abstract base class that users subclass. It follows an
+      init/update/value pattern: ``__init__()`` sets up state, ``update()`` is called
+      once per row, and ``value()`` returns the final result.
+    - ``AggregateFunction`` is the Function subclass that wraps an Aggregator class.
+      Its signature is inferred by inspecting the ``update()`` and ``__init__()`` methods.
+      Update parameters become the function's positional parameters; init parameters become
+      keyword-only parameters (they configure the aggregator, e.g. separator for string_agg).
+    - The ``@pxt.uda`` decorator creates an AggregateFunction from an Aggregator class.
+
+Special parameters:
+    - ``order_by``: Controls the order in which rows are passed to ``update()``.
+    - ``group_by``: Groups rows for windowed aggregation.
+    These are intercepted in ``__call__()`` before being passed to the underlying function.
+
+Polymorphism:
+    Aggregate functions support ``type_substitutions`` for creating overloaded versions
+    that accept different types (e.g. sum for int vs float), and ``.overload()`` for
+    adding new Aggregator classes to handle additional type combinations.
+"""
+
 from __future__ import annotations
 
 import abc
@@ -16,6 +42,28 @@ if TYPE_CHECKING:
 
 
 class Aggregator(abc.ABC):
+    """Abstract base class for user-defined aggregators.
+
+    Subclasses implement a three-phase protocol:
+    1. ``__init__(**init_params)``: Initialize accumulator state. Init parameters
+       become keyword-only arguments of the resulting aggregate function.
+    2. ``update(*row_values)``: Called once per row with the row's column values.
+       Update parameters become the aggregate function's positional arguments.
+    3. ``value()``: Called after all rows have been processed. Returns the final
+       aggregated result. Its return type annotation determines the function's return type.
+
+    Example::
+
+        @pxt.uda
+        class MySum(pxt.Aggregator):
+            def __init__(self):
+                self.total = 0
+            def update(self, val: int) -> None:
+                self.total += val
+            def value(self) -> int:
+                return self.total
+    """
+
     @abc.abstractmethod
     def update(self, *args: Any, **kwargs: Any) -> None: ...
 
@@ -77,8 +125,23 @@ class AggregateFunction(Function):
     def __cls_to_signature(
         self, cls: type[Aggregator], type_substitutions: dict | None = None
     ) -> tuple[Signature, list[str]]:
-        """Inspects the Aggregator class to infer the corresponding function signature. Returns the
-        inferred signature along with the list of init_param_names (for downstream error handling).
+        """Inspect an Aggregator class to infer the corresponding function signature.
+
+        Combines the ``update()`` method's parameters (positional) with the ``__init__()``
+        method's parameters (keyword-only) into a single unified signature. The return type
+        is taken from the ``value()`` method's annotation.
+
+        Args:
+            cls: The Aggregator subclass to inspect.
+            type_substitutions: Optional type variable substitutions for polymorphic overloads.
+
+        Returns:
+            A tuple of (Signature, init_param_names) where init_param_names are the
+            names of parameters from __init__ (used for validation at call time).
+
+        Raises:
+            excs.Error: If update() has no parameters, or if __init__ and update share
+                parameter names.
         """
         from pixeltable import exprs
 
@@ -170,6 +233,13 @@ class AggregateFunction(Function):
         return res
 
     def __call__(self, *args: Any, **kwargs: Any) -> 'exprs.FunctionCall':
+        """Create a FunctionCall expression for this aggregate function.
+
+        Handles special ``order_by`` and ``group_by`` parameters before delegating
+        to the standard signature binding. For ``requires_order_by`` functions,
+        the first positional argument is the ordering expression (it is consumed
+        here and not passed to the underlying aggregator).
+        """
         from pixeltable import exprs
 
         # perform semantic analysis of special parameters 'order_by' and 'group_by'
@@ -304,6 +374,22 @@ def make_aggregator(
     allows_window: bool = False,
     type_substitutions: Sequence[dict] | None = None,
 ) -> AggregateFunction:
+    """Construct an AggregateFunction from an Aggregator class.
+
+    This is the implementation behind the ``@pxt.uda`` decorator. It creates
+    the AggregateFunction, infers its signature from the Aggregator's methods,
+    and validates the symbol path.
+
+    Args:
+        cls: The Aggregator subclass to wrap.
+        requires_order_by: If True, the first argument must be an ordering expression.
+        allows_std_agg: If True, can be used as a standard aggregate (without window).
+        allows_window: If True, can be used with ``order_by`` and ``group_by`` clauses.
+        type_substitutions: Optional list of type substitution dicts for polymorphism.
+
+    Returns:
+        An AggregateFunction instance.
+    """
     class_path = f'{cls.__module__}.{cls.__qualname__}'
     instance = AggregateFunction(cls, type_substitutions, class_path, requires_order_by, allows_std_agg, allows_window)
     # do the path validation at the very end, in order to be able to write tests for the other failure cases

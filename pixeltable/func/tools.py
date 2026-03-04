@@ -1,3 +1,29 @@
+"""Tool and Tools -- LLM tool integration for Pixeltable functions.
+
+This module provides the ``Tool``, ``Tools``, and ``ToolChoice`` classes that wrap
+Pixeltable functions for use as LLM tools (function calling). These classes are
+Pydantic models that can be serialized to JSON in the format expected by LLM APIs
+(OpenAI, Anthropic, etc.).
+
+Architecture:
+    - ``Tool``: Wraps a single Pixeltable Function with optional name/description
+      overrides. Serializes to JSON Schema format via ``model_serializer``.
+      Provides ``invoke()`` to execute the tool from LLM tool-call output.
+    - ``Tools``: A collection of Tool instances. Serializes to a list of tool
+      definitions. Provides ``_invoke()`` to dispatch tool calls to the correct tool.
+    - ``ToolChoice``: Configures how the LLM should select tools (auto, required,
+      or a specific tool name).
+
+The module also defines private helper UDFs (``_extract_str_tool_arg``, etc.) that
+extract typed arguments from the generic dict format of LLM tool call responses.
+These UDFs handle the type conversion from JSON values to Pixeltable-typed values.
+
+Usage pattern:
+    1. Create tools: ``tools = pxt.tools(my_fn1, my_fn2)``
+    2. Pass to LLM: ``t.add_computed_column(response=openai.chat_completions(tools=tools))``
+    3. Invoke results: ``t.add_computed_column(results=tools._invoke(t.response.tool_calls))``
+"""
+
 import json
 import uuid
 from typing import TYPE_CHECKING, Any, Callable, TypeVar
@@ -25,6 +51,18 @@ if TYPE_CHECKING:
 
 
 class Tool(pydantic.BaseModel):
+    """Wraps a Pixeltable Function for use as an LLM tool.
+
+    Serializes to JSON Schema format compatible with OpenAI/Anthropic tool calling APIs.
+    The ``model_serializer`` produces a dict with 'name', 'description', 'parameters'
+    (JSON Schema object), and 'required' fields.
+
+    Attributes:
+        fn: The Pixeltable Function to expose as a tool.
+        name: Optional override for the tool name (defaults to fn.name).
+        description: Optional override for the tool description (defaults to fn.comment()).
+    """
+
     # Allow arbitrary types so that we can include a Pixeltable function in the schema.
     # We will implement a model_serializer to ensure the Tool model can be serialized.
     model_config = pydantic.ConfigDict(arbitrary_types_allowed=True)
@@ -50,9 +88,15 @@ class Tool(pydantic.BaseModel):
             'additionalProperties': False,  # TODO Handle kwargs?
         }
 
-    # The output of `tool_calls` must be a dict in standardized tool invocation format:
-    # {tool_name: [{'args': {name1: value1, name2: value2, ...}}, ...], ...}
     def invoke(self, tool_calls: 'exprs.Expr') -> 'exprs.Expr':
+        """Create an expression that executes this tool from LLM tool-call output.
+
+        The tool_calls expression must be in standardized format:
+        ``{tool_name: [{'args': {name1: value1, ...}}, ...], ...}``
+
+        Returns an expression that maps over the tool's invocations and calls
+        the underlying function with the extracted arguments.
+        """
         import pixeltable.functions as pxtf
 
         func_name = self.name or self.fn.name
@@ -79,6 +123,17 @@ class Tool(pydantic.BaseModel):
 
 
 class ToolChoice(pydantic.BaseModel):
+    """Configuration for how an LLM should select tools.
+
+    Exactly one of ``auto``, ``required``, or ``tool`` must be set.
+
+    Attributes:
+        auto: If True, the LLM decides whether to use tools.
+        required: If True, the LLM must use at least one tool.
+        tool: If set, the LLM must use the specified tool by name.
+        parallel_tool_calls: If True, allow the LLM to call multiple tools in parallel.
+    """
+
     auto: bool
     required: bool
     tool: str | None
@@ -86,6 +141,15 @@ class ToolChoice(pydantic.BaseModel):
 
 
 class Tools(pydantic.BaseModel):
+    """A collection of Tool instances for LLM tool calling.
+
+    Serializes to a list of tool definitions in JSON Schema format.
+    Provides ``_invoke()`` to dispatch LLM tool call results to the correct tools.
+
+    Attributes:
+        tools: The list of Tool wrappers.
+    """
+
     tools: list[Tool]
 
     @pydantic.model_serializer
@@ -106,6 +170,23 @@ class Tools(pydantic.BaseModel):
         tool: str | Function | None = None,
         parallel_tool_calls: bool = True,
     ) -> ToolChoice:
+        """Create a ToolChoice configuration for these tools.
+
+        Exactly one of ``auto``, ``required``, or ``tool`` must be specified.
+
+        Args:
+            auto: Let the LLM decide whether to call tools.
+            required: Force the LLM to call at least one tool.
+            tool: Force the LLM to call a specific tool (by name or Function reference).
+            parallel_tool_calls: Allow parallel tool invocations.
+
+        Returns:
+            A ToolChoice configuration object.
+
+        Raises:
+            excs.Error: If not exactly one option is specified, or if the named tool
+                is not in the tools list.
+        """
         if sum([auto, required, tool is not None]) != 1:
             raise excs.Error('Exactly one of `auto`, `required`, or `tool` must be specified.')
         tool_name: str | None = None

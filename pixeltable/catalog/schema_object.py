@@ -1,3 +1,18 @@
+"""
+SchemaObject - Abstract base class for all addressable objects in the catalog.
+
+Every object that lives in the Pixeltable namespace hierarchy (directories, tables,
+views, snapshots) inherits from SchemaObject. It provides:
+- A UUID identifier (_id)
+- A human-readable name (_name)
+- A parent directory reference (_dir_id), None only for the root directory
+- Path resolution via the catalog's directory tree
+- Move/rename support
+
+This base class ensures that all schema objects can be located by path and
+displayed in error messages consistently.
+"""
+
 from abc import abstractmethod
 from typing import TYPE_CHECKING
 from uuid import UUID
@@ -9,9 +24,10 @@ if TYPE_CHECKING:
 
 
 class SchemaObject:
-    """
-    Base class of all addressable objects within a Db.
-    Each object has an id, a name and a parent directory.
+    """Abstract base class for all named objects in the Pixeltable catalog.
+
+    Subclasses: Dir, Table (and its subclasses InsertableTable, View).
+    Each object has a UUID, a name, and a parent directory, forming a tree of namespaces.
     """
 
     _id: UUID

@@ -1,5 +1,18 @@
 """
-Pixeltable UDFs for `DocumentType`.
+Pixeltable UDFs for the ``DocumentType`` column type.
+
+This module provides the ``document_splitter`` iterator, which chunks documents (HTML, Markdown,
+PDF, TXT, PPTX, DOCX, XLSX) into smaller pieces using configurable separator strategies:
+- **heading** / **paragraph**: Structural boundaries from the document.
+- **sentence**: NLP-based sentence segmentation via spaCy.
+- **token_limit** / **char_limit**: Fixed-size chunks with optional overlap.
+- **page**: Page-level splitting (PDF only), optionally extracting page images.
+
+The iterator supports metadata extraction (title, headings, sourceline, page number, bounding box)
+and text cleanup via ``ftfy.fix_text``. Token counting uses ``tiktoken``.
+
+Typical usage is via ``pxt.create_view()`` with the iterator to create a chunked view of documents
+for downstream embedding and retrieval.
 """
 
 import logging
@@ -24,26 +37,29 @@ if TYPE_CHECKING:
 _logger = logging.getLogger('pixeltable')
 
 
+# Element types that can be extracted from documents.
 class Element(Enum):
-    TEXT = 1
-    IMAGE = 2
+    TEXT = 1    # Extract text content
+    IMAGE = 2  # Extract images (PDF page rendering only)
 
 
+# Metadata fields that can be included in chunked output rows.
 class ChunkMetadata(Enum):
-    TITLE = 1
-    HEADING = 2
-    SOURCELINE = 3
-    PAGE = 4
-    BOUNDING_BOX = 5
+    TITLE = 1         # Document title (from <title> tag or frontmatter)
+    HEADING = 2       # Heading hierarchy at chunk start ({h1: ..., h2: ...})
+    SOURCELINE = 3    # Source line number in the original document (HTML only)
+    PAGE = 4          # Page number (PDF only)
+    BOUNDING_BOX = 5  # Bounding box on page as {x1, y1, x2, y2} (PDF only)
 
 
+# Separator strategies that determine where document chunks are split.
 class Separator(Enum):
-    HEADING = 1
-    PARAGRAPH = 2
-    SENTENCE = 3
-    TOKEN_LIMIT = 4
-    CHAR_LIMIT = 5
-    PAGE = 6
+    HEADING = 1      # Split at heading boundaries (h1-h6)
+    PARAGRAPH = 2    # Split at paragraph boundaries
+    SENTENCE = 3     # Split at sentence boundaries (requires spaCy)
+    TOKEN_LIMIT = 4  # Split at fixed token count (requires tiktoken)
+    CHAR_LIMIT = 5   # Split at fixed character count
+    PAGE = 6         # Split at page boundaries (PDF only)
 
 
 @dataclass
@@ -114,8 +130,10 @@ def _parse_elements(elements: list[Literal['text', 'image']] | None) -> list[Ele
     return result
 
 
-_HTML_HEADINGS = {'h1', 'h2', 'h3', 'h4', 'h5', 'h6'}
+_HTML_HEADINGS = {'h1', 'h2', 'h3', 'h4', 'h5', 'h6'}  # Valid HTML heading tag names
 
+# Maps ChunkMetadata enum values to their corresponding Pixeltable column types.
+# Used by conditional_output_schema to build the output schema dynamically.
 _METADATA_COLUMN_TYPES: dict = {
     ChunkMetadata.TITLE: ts.String | None,
     ChunkMetadata.HEADING: ts.Json | None,

@@ -1,3 +1,24 @@
+"""
+Column - Represents a single column in a Pixeltable table or view.
+
+A Column holds all metadata needed for query execution and data storage:
+- Name, type, and storage configuration (stored vs. computed-on-demand)
+- The computed expression (value_expr) for computed columns
+- SQLAlchemy column mappings (sa_col) for the physical store table
+- Cell metadata columns for tracking errors on media/computed columns
+- Schema versioning info (when the column was added/dropped)
+
+Columns are owned by a TableVersion via a TableVersionHandle reference.
+They are created during table creation or via add_column/add_computed_column,
+and become part of the table's schema history (never physically deleted, just
+marked with a schema_version_drop).
+
+Key design decisions:
+- Column identity is (tbl_id, col_id), not name - names can be changed
+- System columns (e.g., index value/undo columns) have name=None
+- value_expr is lazily deserialized from value_expr_dict on first access
+"""
+
 from __future__ import annotations
 
 import logging
@@ -152,7 +173,11 @@ class Column:
         self._comment = comment
 
     def to_md(self, pos: int | None = None) -> tuple[schema.ColumnMd, schema.SchemaColumn | None]:
-        """Returns the Column and optional SchemaColumn metadata for this Column."""
+        """Serialize this Column into metadata records for persistence.
+
+        Returns a ColumnMd (always) and a SchemaColumn (only for user-facing columns with a name and position).
+        System columns (index value/undo cols) have no SchemaColumn because they are invisible to users.
+        """
         assert self.is_pk is not None
         col_md = schema.ColumnMd(
             id=self.id,
@@ -177,10 +202,14 @@ class Column:
         return col_md, sch_md
 
     def init_value_expr(self, tvp: 'TableVersionPath' | None) -> None:
-        """
-        Initialize the value_expr from its dict representation, if necessary.
+        """Initialize the value_expr from its dict representation, if necessary.
+
+        This is called during TableVersion._init_schema() after all columns are registered,
+        because expression deserialization requires column lookups.
 
         If `tvp` is not None, retarget the value_expr to the given TableVersionPath.
+        Retargeting is needed for snapshots and replicas so that column references point
+        to the correct (versioned) table rather than the live table.
         """
         from pixeltable import exprs
 
@@ -329,8 +358,10 @@ class Column:
         self.value_expr.fn.source()
 
     def create_sa_cols(self) -> None:
-        """
-        These need to be recreated for every sql.Table instance
+        """Create SQLAlchemy Column objects for this Column's physical storage.
+
+        Must be called each time a new SQLAlchemy Table is constructed, because SA Column
+        objects are bound to a specific Table instance and cannot be reused.
         """
         assert self.is_stored
         assert self.stores_cellmd is not None

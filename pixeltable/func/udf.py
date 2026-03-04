@@ -1,3 +1,34 @@
+"""UDF creation -- the @pxt.udf and @pxt.expr_udf decorators, and pxt.udf(table).
+
+This module is the main entry point for creating Pixeltable user-defined functions.
+It provides three mechanisms:
+
+1. **@pxt.udf decorator**: Converts a Python function into a ``CallableFunction``.
+   Supports various options:
+   - ``batch_size``: Enable batched execution for vectorized operations.
+   - ``substitute_fn``: Use a different callable for execution (useful for wrappers).
+   - ``is_method`` / ``is_property``: Register as a type method/property.
+   - ``type_substitutions``: Create polymorphic overloads.
+   - ``resource_pool``: Assign to a resource pool for rate limiting.
+
+2. **@pxt.expr_udf decorator**: Converts a function that constructs a Pixeltable
+   expression into an ``ExprTemplateFunction``. The function is called once with
+   Variable arguments to capture the expression template.
+
+3. **pxt.udf(table)**: Creates an ``ExprTemplateFunction`` from a table's schema,
+   where data columns become parameters and computed columns become expressions
+   in the template.
+
+Registration:
+    Module-level UDFs (defined in importable .py files) are automatically registered
+    in the FunctionRegistry by their fully-qualified path. Locally-defined UDFs
+    (notebooks, lambdas) are stored in the database via cloudpickle.
+
+Script detection:
+    UDFs defined directly in the global namespace of a Python script (not a module
+    or notebook) are rejected, because they cannot be reliably serialized or resolved.
+"""
+
 from __future__ import annotations
 
 import inspect
@@ -114,11 +145,35 @@ def make_function(
     force_stored: bool = False,
     from_decorator: bool = False,
 ) -> CallableFunction:
-    """
-    Constructs a `CallableFunction` from the specified parameters.
-    If `substitute_fn` is specified, then `decorated_fn`
-    will be used only for its signature, with execution delegated to
-    `substitute_fn`.
+    """Construct a CallableFunction from a Python callable and configuration options.
+
+    This is the core implementation behind the ``@pxt.udf`` decorator. It:
+    1. Determines the function path (module-level vs stored/local).
+    2. Infers the signature from type annotations (with optional overrides).
+    3. Validates batch_size consistency with parameter annotations.
+    4. Creates a CallableFunction and registers it if module-level.
+
+    Args:
+        decorated_fn: The Python callable to wrap.
+        return_type: Optional explicit return type override.
+        param_types: Optional explicit parameter type overrides.
+        batch_size: If set, enable batched execution with this batch size.
+        substitute_fn: If set, use this callable for execution instead of decorated_fn.
+        is_method: Register as a type method (e.g. ``t.col.method()``).
+        is_property: Register as a type property (e.g. ``t.col.prop``).
+        is_deterministic: If False, the function may return different results for the
+            same inputs (disables caching optimizations).
+        resource_pool: Assign to a named resource pool for rate limiting.
+        type_substitutions: List of type substitution dicts for polymorphic overloads.
+        function_name: Override the display name (defaults to decorated_fn.__name__).
+        force_stored: Force storing in the database even for module functions.
+        from_decorator: True if called from the @udf decorator (affects script detection).
+
+    Returns:
+        A CallableFunction instance.
+
+    Raises:
+        excs.Error: For various validation failures (see inline checks).
     """
     defined_in_script = False
     # Obtain function_path from decorated_fn when appropriate
@@ -226,6 +281,17 @@ def expr_udf(*, param_types: list[ts.ColumnType] | None = None) -> Callable[[Cal
 
 
 def expr_udf(*args: Any, **kwargs: Any) -> Any:
+    """Decorator to create an ExprTemplateFunction from a function that returns an expression.
+
+    The decorated function is called once with Variable arguments to capture the
+    expression template. The resulting ExprTemplateFunction, when called with actual
+    arguments, substitutes them into the template.
+
+    Can be used with or without parentheses:
+        - ``@pxt.expr_udf`` (no args)
+        - ``@pxt.expr_udf(param_types=[...])`` (explicit types)
+    """
+
     def make_expr_template(py_fn: Callable, param_types: list[ts.ColumnType] | None) -> ExprTemplateFunction:
         from pixeltable import exprs
 
@@ -259,8 +325,11 @@ def expr_udf(*args: Any, **kwargs: Any) -> Any:
 
 
 def from_table(tbl: catalog.Table, return_value: 'exprs.Expr' | None, description: str | None) -> ExprTemplateFunction:
-    """
-    Constructs an `ExprTemplateFunction` from a `Table`.
+    """Construct an ExprTemplateFunction from a Table's schema.
+
+    Creates a function where data columns become parameters and computed columns
+    become expressions in the template. This allows evaluating a table's computed
+    column logic as a standalone function.
 
     The constructed function will have one parameter for each data column in the table, which is optional (with
     default None) if and only if its column type is nullable. The output of the function is a dict of the form

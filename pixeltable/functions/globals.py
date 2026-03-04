@@ -1,3 +1,15 @@
+"""
+Global aggregate and utility functions for Pixeltable.
+
+This module defines the core aggregate functions (sum, count, min, max, mean) and the
+``map`` higher-order function. These are re-exported at the ``pixeltable.functions`` package
+level so users can call them as ``pxt.functions.sum(t.col)`` etc.
+
+Each aggregate is implemented as a ``@func.uda`` (User-Defined Aggregate) class that extends
+``func.Aggregator``. They support both in-Python evaluation and SQL push-down via ``@<agg>.to_sql``
+decorators that map to the corresponding SQLAlchemy/PostgreSQL aggregate functions.
+"""
+
 import builtins
 import typing
 from typing import Any, Callable
@@ -9,14 +21,19 @@ from pixeltable.utils.code import local_public_names
 
 
 # TODO: remove and replace calls with astype()
+# Utility to force-cast an expression's column type. Intended for internal use;
+# should eventually be replaced by the public astype() API.
 def cast(expr: exprs.Expr, target_type: ts.ColumnType | type) -> exprs.Expr:
     expr.col_type = ts.ColumnType.normalize_type(target_type)
     return expr
 
 
+# Generic type variable used across all aggregate functions to support
+# polymorphism over int and float (and other types for count/min/max).
 T = typing.TypeVar('T')
 
 
+# sum supports int and float inputs; allows_window=True enables use in window expressions.
 @func.uda(allows_window=True, type_substitutions=({T: int | None}, {T: float | None}))  # type: ignore[misc]
 class sum(func.Aggregator, typing.Generic[T]):
     """
@@ -56,6 +73,7 @@ class sum(func.Aggregator, typing.Generic[T]):
         return self.sum
 
 
+# SQL push-down for sum: delegates to PostgreSQL's SUM() aggregate.
 @sum.to_sql
 def _(val: sql.ColumnElement) -> sql.ColumnElement | None:
     # This can produce a Decimal. We are deliberately avoiding an explicit cast to a Bigint here, because that can
@@ -63,6 +81,7 @@ def _(val: sql.ColumnElement) -> sql.ColumnElement | None:
     return sql.sql.func.sum(val)
 
 
+# count accepts all Pixeltable column types; each substitution maps T to (type | None).
 @func.uda(
     allows_window=True,
     # Allow counting non-null values of any type
@@ -103,11 +122,13 @@ class count(func.Aggregator, typing.Generic[T]):
         return self.count
 
 
+# SQL push-down for count: delegates to PostgreSQL's COUNT() aggregate.
 @count.to_sql
 def _(val: sql.ColumnElement) -> sql.ColumnElement | None:
     return sql.sql.func.count(val)
 
 
+# min supports str, int, float, bool, and Timestamp types for ordering comparisons.
 @func.uda(
     allows_window=True,
     type_substitutions=tuple({T: t | None} for t in (str, int, float, bool, ts.Timestamp)),  # type: ignore[misc]
@@ -150,6 +171,8 @@ class min(func.Aggregator, typing.Generic[T]):
         return self.val
 
 
+# SQL push-down for min: delegates to PostgreSQL's MIN(), except for booleans
+# which PostgreSQL does not support directly with MIN/MAX.
 @min.to_sql
 def _(val: sql.ColumnElement) -> sql.ColumnElement | None:
     if val.type.python_type is bool:
@@ -160,6 +183,7 @@ def _(val: sql.ColumnElement) -> sql.ColumnElement | None:
     return sql.sql.func.min(val)
 
 
+# max supports the same types as min: str, int, float, bool, Timestamp.
 @func.uda(
     allows_window=True,
     type_substitutions=tuple({T: t | None} for t in (str, int, float, bool, ts.Timestamp)),  # type: ignore[misc]
@@ -202,6 +226,7 @@ class max(func.Aggregator, typing.Generic[T]):
         return self.val
 
 
+# SQL push-down for max: same boolean limitation as min.
 @max.to_sql
 def _(val: sql.ColumnElement) -> sql.ColumnElement | None:
     if val.type.python_type is bool:
@@ -210,6 +235,8 @@ def _(val: sql.ColumnElement) -> sql.ColumnElement | None:
     return sql.sql.func.max(val)
 
 
+# mean only supports numeric types (int, float). Unlike sum/count/min/max, it does NOT
+# allow window usage (allows_window defaults to False).
 @func.uda(type_substitutions=({T: int | None}, {T: float | None}))  # type: ignore[misc]
 class mean(func.Aggregator, typing.Generic[T]):
     """
@@ -253,11 +280,14 @@ class mean(func.Aggregator, typing.Generic[T]):
         return self.sum / self.count  # type: ignore[operator]
 
 
+# SQL push-down for mean: delegates to PostgreSQL's AVG() aggregate.
 @mean.to_sql
 def _(val: sql.ColumnElement) -> sql.ColumnElement | None:
     return sql.sql.func.avg(val)
 
 
+# map is a higher-order function (not an aggregate). It applies an expression-level
+# transformation to each element of a JSON array column, producing a new JSON array.
 def map(expr: exprs.Expr, fn: Callable[[exprs.Expr], Any]) -> exprs.Expr:
     """
     Applies a mapping function to each element of a list.

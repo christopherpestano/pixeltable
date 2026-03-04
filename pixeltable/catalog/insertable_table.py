@@ -1,3 +1,22 @@
+"""
+InsertableTable - A Table subclass that supports insert and delete operations.
+
+This is the concrete class for base tables (as opposed to views/snapshots).
+It extends Table with:
+- insert(): Accepts rows as dicts, DataFrames, Pydantic models, file paths, etc.
+- delete(): Removes rows matching a predicate
+- _create(): Factory method that builds metadata for a new base table
+
+InsertableTable is the class returned by pxt.create_table(). Views and snapshots
+use the View class instead, which disallows direct inserts/deletes.
+
+Data insertion flow:
+1. insert() normalizes the input source (dicts, Pydantic, DataFrame, etc.)
+2. TableDataConduit specializes the source for the table schema
+3. TableVersion.insert() builds an execution plan and writes rows to the store
+4. Changes propagate to downstream views via the mutable view tree
+"""
+
 from __future__ import annotations
 
 import enum
@@ -34,7 +53,11 @@ _logger = logging.getLogger('pixeltable')
 
 
 class OnErrorParameter(enum.Enum):
-    """Supported values for the on_error parameter"""
+    """Supported values for the on_error parameter of insert operations.
+
+    ABORT: Stop the insert and raise an exception on the first error.
+    IGNORE: Continue inserting; rows with errors get None values and error metadata.
+    """
 
     ABORT = 'abort'
     IGNORE = 'ignore'

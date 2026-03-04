@@ -1,3 +1,25 @@
+"""ExprTemplateFunction -- a parameterized expression template.
+
+This module implements expression templates, which are Pixeltable functions defined
+not by a Python callable but by a parameterized Pixeltable expression tree. When
+called, an ExprTemplateFunction substitutes its arguments into the template expression
+to produce a concrete Expr.
+
+Primary use cases:
+1. **Function.using()**: When ``fn.using(model='gpt-4')`` is called, the result is an
+   ExprTemplateFunction whose template expression is ``fn(input, model='gpt-4')``.
+   The residual parameter is just ``input``.
+2. **@pxt.expr_udf**: A decorator that creates an ExprTemplateFunction from a Python
+   function that constructs and returns a Pixeltable expression.
+3. **pxt.udf(table)**: Creates an ExprTemplateFunction from a table's schema, allowing
+   the table's computed columns to be evaluated as a function.
+
+Classes:
+    ExprTemplate: Holds a single (expression, signature) pair -- one overload of
+        an ExprTemplateFunction.
+    ExprTemplateFunction: A Function subclass that wraps one or more ExprTemplates.
+"""
+
 from typing import Any, Sequence
 
 from pixeltable import exceptions as excs, exprs, type_system as ts
@@ -7,10 +29,20 @@ from .signature import Signature
 
 
 class ExprTemplate:
-    """
-    Encapsulates a single signature of an `ExprTemplateFunction` and its associated parameterized expression,
-    along with various precomputed metadata. (This is analogous to a `Callable`-`Signature` pair in a
-    `CallableFunction`.)
+    """Encapsulates a single overload of an ExprTemplateFunction.
+
+    Each ExprTemplate holds a parameterized expression and its corresponding signature.
+    This is analogous to a (Callable, Signature) pair in a CallableFunction. The expression
+    contains Variable nodes that correspond to the signature's parameters; when the template
+    is instantiated, these Variables are substituted with actual argument expressions.
+
+    Attributes:
+        expr: The parameterized expression tree, containing Variable nodes as placeholders.
+        signature: The typed signature describing the template's parameters and return type.
+        param_exprs: Mapping from parameter name to the corresponding Variable expression
+            in the template. Used during instantiation to perform substitution.
+        defaults: Mapping from parameter name to default Literal value, extracted from the
+            signature for convenient access.
     """
 
     expr: 'exprs.Expr'
@@ -39,7 +71,16 @@ class ExprTemplate:
 
 
 class ExprTemplateFunction(Function):
-    """A parameterized expression from which an executable Expr is created with a function call."""
+    """A parameterized expression from which an executable Expr is created with a function call.
+
+    Unlike CallableFunction (which wraps a Python callable), ExprTemplateFunction wraps
+    an expression tree. When called, it substitutes arguments into the template to produce
+    a concrete expression. This is the mechanism behind ``.using()`` and ``@pxt.expr_udf``.
+
+    Attributes:
+        templates: One ExprTemplate per overloaded signature.
+        self_name: The display name of this function.
+    """
 
     templates: list[ExprTemplate]
     self_name: str
@@ -59,6 +100,15 @@ class ExprTemplateFunction(Function):
         return self.templates[0]
 
     def instantiate(self, args: Sequence[Any], kwargs: dict[str, Any]) -> 'exprs.Expr':
+        """Substitute arguments into the template expression to produce a concrete Expr.
+
+        Binds args/kwargs to the template's signature, applies defaults for missing
+        parameters, then substitutes each Variable in the template with the corresponding
+        argument expression.
+
+        Returns:
+            A new Expr with all Variables replaced by the bound arguments.
+        """
         assert not self.is_polymorphic
         template = self.template
         bound_args = self.signature.py_signature.bind(*args, **kwargs).arguments
@@ -107,6 +157,11 @@ class ExprTemplateFunction(Function):
         return None
 
     def exec(self, args: Sequence[Any], kwargs: dict[str, Any]) -> Any:
+        """Execute the template by instantiating it and evaluating the resulting expression.
+
+        Creates a RowBuilder with the instantiated expression as its sole output,
+        evaluates it, and returns the result.
+        """
         assert not self.is_polymorphic
         expr = self.instantiate(args, kwargs)
         row_builder = exprs.RowBuilder(output_exprs=[expr], columns=[], input_exprs=[])

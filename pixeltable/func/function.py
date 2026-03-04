@@ -1,3 +1,24 @@
+"""Abstract base class for all Pixeltable function types.
+
+This module defines ``Function``, the root of the Pixeltable function hierarchy.
+Every kind of function -- scalar UDFs, aggregate functions, expression templates,
+query templates -- inherits from ``Function`` and implements its abstract interface.
+
+The base class provides:
+- Signature management and polymorphic overload resolution
+- Argument binding and type validation via ``_bind_to_matching_signature``
+- Return type inference (including conditional return types)
+- Serialization/deserialization via ``as_dict``/``from_dict``
+- The ``.using()`` API for creating partially-applied expression templates
+- SQL translation hooks (``to_sql`` decorator)
+- Resource pool determination (``resource_pool`` decorator)
+
+It also defines ``InvalidFunction``, a placeholder for functions that could not be
+deserialized (e.g. because the underlying Python module was renamed or the decorator
+was removed). This allows tables with broken computed columns to still be loaded
+partially, rather than failing completely.
+"""
+
 from __future__ import annotations
 
 import importlib
@@ -74,15 +95,18 @@ class Function(ABC):
 
     @property
     def is_valid(self) -> bool:
+        """True if this function has at least one valid signature."""
         return len(self.signatures) > 0
 
     @property
     def name(self) -> str:
+        """The short name of this function (last segment of self_path)."""
         assert self.self_path is not None
         return self.self_path.split('.')[-1]
 
     @property
     def display_name(self) -> str:
+        """Human-readable name, stripping the 'pixeltable.functions.' prefix if present."""
         if self.self_path is None:
             return '<anonymous>'
         ptf_prefix = 'pixeltable.functions.'
@@ -92,10 +116,12 @@ class Function(ABC):
 
     @property
     def is_polymorphic(self) -> bool:
+        """True if this function has multiple overloaded signatures."""
         return len(self.signatures) > 1
 
     @property
     def signature(self) -> Signature:
+        """The sole signature of a non-polymorphic function. Asserts if polymorphic."""
         assert not self.is_polymorphic
         return self.signatures[0]
 
@@ -157,6 +183,18 @@ class Function(ABC):
         raise NotImplementedError()
 
     def __call__(self, *args: Any, **kwargs: Any) -> 'exprs.FunctionCall':
+        """Create a FunctionCall expression by binding arguments to this function.
+
+        Converts all arguments to Expr objects, resolves the matching overload
+        signature, validates types, and returns a FunctionCall expression node
+        that can be used in computed columns or queries.
+
+        Returns:
+            A FunctionCall expression representing the deferred invocation.
+
+        Raises:
+            excs.Error: If arguments are invalid or no matching signature is found.
+        """
         from pixeltable import exprs
 
         args = [exprs.Expr.from_object(arg) for arg in args]
@@ -177,6 +215,16 @@ class Function(ABC):
         return exprs.FunctionCall(resolved_fn, args, kwargs, return_type)
 
     def _bind_to_matching_signature(self, args: Sequence[Any], kwargs: dict[str, Any]) -> tuple[Self, dict[str, Any]]:
+        """Find the first signature that matches the given arguments and return the resolved function.
+
+        For non-polymorphic functions, directly attempts binding and surfaces errors.
+        For polymorphic functions, tries each signature in declaration order, catching
+        errors, and returns the first match. If none match, raises a generic error.
+
+        Returns:
+            A tuple of (resolved_fn, bound_args) where resolved_fn is a single-signature
+            copy of this function corresponding to the matched overload.
+        """
         result: int = -1
         bound_args: dict[str, Any] | None = None
         assert len(self.signatures) > 0
@@ -201,6 +249,18 @@ class Function(ABC):
         return self._resolved_fns[result], bound_args
 
     def _bind_to_signature(self, signature_idx: int, args: Sequence[Any], kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Attempt to bind args/kwargs to a specific signature by index.
+
+        Uses Python's ``inspect.Signature.bind()`` for positional/keyword matching,
+        then validates the bound arguments against the Pixeltable type constraints.
+
+        Returns:
+            A dict of parameter-name -> Expr for the bound arguments.
+
+        Raises:
+            TypeError: If Python-level binding fails (wrong number of args, etc.)
+            excs.Error: If Pixeltable type validation fails.
+        """
         from pixeltable import exprs
 
         signature = self.signatures[signature_idx]
@@ -326,6 +386,22 @@ class Function(ABC):
         return fn
 
     def using(self, **kwargs: Any) -> 'ExprTemplateFunction':
+        """Create a partially-applied function by binding some parameters to constant values.
+
+        Returns an ExprTemplateFunction with a reduced signature (only the unbound
+        parameters remain). This is commonly used for embedding functions where a
+        model parameter is fixed, e.g.: ``embed_fn.using(model_id='text-embedding-3-small')``.
+
+        Args:
+            **kwargs: Parameter name -> constant value bindings.
+
+        Returns:
+            An ExprTemplateFunction with the residual (unbound) parameters.
+
+        Raises:
+            excs.Error: If a parameter name is unknown, a value is not constant,
+                or no matching signature is found.
+        """
         from .expr_template_function import ExprTemplateFunction
 
         assert len(self.signatures) > 0
@@ -350,6 +426,15 @@ class Function(ABC):
             return ExprTemplateFunction(templates)
 
     def _bind_and_create_template(self, kwargs: dict[str, Any]) -> 'ExprTemplate':
+        """Create an ExprTemplate by binding the given kwargs and constructing a FunctionCall.
+
+        Validates each kwarg as a constant, creates Variable expressions for the remaining
+        (unbound) parameters, builds a FunctionCall expression, and wraps everything in
+        an ExprTemplate with the residual signature.
+
+        Returns:
+            An ExprTemplate encapsulating the parameterized function call.
+        """
         from pixeltable import exprs
 
         from .expr_template_function import ExprTemplate
@@ -504,6 +589,20 @@ class Function(ABC):
 
 
 class InvalidFunction(Function):
+    """Placeholder for a Function that could not be deserialized.
+
+    Created when a stored function reference cannot be resolved -- for example, when
+    the Python module containing the UDF has been renamed, the function was removed,
+    or the @pxt.udf decorator was removed. This allows the system to load tables that
+    reference broken functions without crashing, deferring the error to the point where
+    the function is actually invoked.
+
+    Attributes:
+        fn_dict: The original serialized metadata dict that failed to load, preserved
+            verbatim so it can be re-serialized without data loss.
+        error_msg: A human-readable description of why the function could not be loaded.
+    """
+
     fn_dict: dict[str, Any]
     error_msg: str
 

@@ -1,8 +1,22 @@
 """
-Pixeltable UDFs
-that wrap various endpoints from the Google Gemini API. In order to use them, you must
-first `pip install google-genai` and configure your Gemini credentials, as described in
-the [Working with Gemini](https://docs.pixeltable.com/notebooks/integrations/working-with-gemini) tutorial.
+Pixeltable UDFs that wrap the Google Gemini (and Imagen/Veo) APIs.
+
+This module provides:
+- ``generate_content``: Text/multimodal generation via the Gemini API, with tool-calling support
+  and automatic large-video upload handling via the Files API.
+- ``generate_images``: Image generation via Imagen models.
+- ``generate_videos``: Video generation via Veo models (long-running operation with polling).
+- ``generate_embedding``: Text embedding with support for both real-time and batch APIs.
+- ``invoke_tools``: Bridges Gemini function_call responses to Pixeltable's tool system.
+
+Rate limiting uses a per-model resource pool with retry logic that parses Google's
+``RetryInfo`` protobuf details from 429 responses.
+
+In order to use these UDFs, you must first ``pip install google-genai`` and configure your
+Gemini credentials, as described in the
+[Working with Gemini](https://docs.pixeltable.com/notebooks/integrations/working-with-gemini) tutorial.
+
+Environment variable: ``GOOGLE_API_KEY`` or ``GEMINI_API_KEY``
 """
 
 import asyncio
@@ -33,10 +47,12 @@ if TYPE_CHECKING:
 _logger = logging.getLogger('pixeltable')
 
 # Max raw file size (bytes) for inline_data; larger files use the Files API.
-# The API limit is 100MB for the base64-encoded payload, so we use ~75MB raw (75 * 4/3 ≈ 100MB encoded).
+# The API limit is 100MB for the base64-encoded payload, so we use ~75MB raw (75 * 4/3 ~ 100MB encoded).
+# Videos under this threshold are base64-encoded inline; larger ones are uploaded via Files API.
 GEMINI_INLINE_VIDEO_LIMIT_BYTES = 75 * 1024**2
 
-# Placeholder key used in first pass for large file uploads.
+# Sentinel key used in the contents tree to mark positions where a large file upload
+# was initiated. After uploads complete, these placeholders are replaced with file_data refs.
 _UPLOAD_PLACEHOLDER_KEY = '__google_genai_upload_ref__'
 
 
@@ -52,6 +68,12 @@ def _genai_client() -> 'genai.client.Client':
 
 
 class GeminiRateLimitsInfo(env.RateLimitsInfo):
+    """Rate limit tracker for Gemini API.
+
+    Gemini does not provide rate-limit headers in responses, so this relies on
+    parsing 429 error details to extract RetryInfo delays for adaptive throttling.
+    """
+
     def __init__(self) -> None:
         super().__init__(self._get_request_resources)
 
@@ -139,20 +161,25 @@ async def generate_content(
     large_video_paths: list[str] = []
 
     try:
+        # First pass: traverse contents, inline small videos, start async uploads for large ones.
         contents = _process_media_contents(contents, client.aio, upload_tasks, large_video_paths)
         if upload_tasks:
+            # Wait for all large file uploads to complete.
             uploaded = await asyncio.gather(*upload_tasks)
-            # poll till server finished uploading files (state is ACTIVE)
+            # Poll the Files API until all uploaded files reach ACTIVE state.
             await _poll_until_active(async_client=client.aio, uploaded=uploaded, video_paths=large_video_paths)
+            # Second pass: replace upload placeholders with actual file_data references.
             contents = _replace_upload_placeholders(contents, uploaded)
         response = await client.aio.models.generate_content(model=model, contents=contents, config=config_)
         return response.model_dump()
     finally:
+        # Clean up: delete all temporarily uploaded files from Google's storage.
         if uploaded:
             await asyncio.gather(*[client.aio.files.delete(name=f.name) for f in uploaded], return_exceptions=True)
 
 
 def __convert_pxt_tool(pxt_tool: dict) -> dict:
+    """Convert a Pixeltable tool schema to Gemini's function_declaration format."""
     return {
         'name': pxt_tool['name'],
         'description': pxt_tool['description'],
@@ -416,9 +443,13 @@ async def generate_embedding(
     return results
 
 
+# Known default dimensionalities for Gemini embedding models.
+# Used to set the correct array shape at schema time when no explicit dimensionality is specified.
 _DEFAULT_EMBEDDING_DIMENSIONALITY_BY_MODEL: dict[str, int] = {'gemini-embedding-001': 3072}
 
 
+# conditional_return_type lets Pixeltable determine the exact output embedding dimensions
+# at schema definition time, enabling proper array type validation.
 @generate_embedding.conditional_return_type
 def _(model: str, config: dict | None) -> ts.ArrayType:
     config_ = _embedding_config(config)

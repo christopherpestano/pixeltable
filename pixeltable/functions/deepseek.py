@@ -1,8 +1,14 @@
 """
 Pixeltable UDFs for Deepseek AI models.
 
-Provides integration with Deepseek's language models for chat completions
-and other AI capabilities.
+This module wraps the Deepseek chat/completions API endpoint. Deepseek uses an
+OpenAI-compatible API, so the underlying client is ``openai.AsyncOpenAI`` pointed
+at ``https://api.deepseek.com``.
+
+Provides:
+- ``chat_completions``: Chat completion with tool-calling support.
+
+Environment variable: ``DEEPSEEK_API_KEY``
 """
 
 import json
@@ -19,6 +25,8 @@ if TYPE_CHECKING:
     import openai
 
 
+# Register a Deepseek client that reuses the OpenAI SDK with a custom base_url.
+# This is a common pattern for OpenAI-compatible providers (Deepseek, OpenRouter, etc.).
 @env.register_client('deepseek')
 def _(api_key: str) -> 'openai.AsyncOpenAI':
     import openai
@@ -86,9 +94,11 @@ async def chat_completions(
         model_kwargs = {}
 
     if tools is not None:
+        # Convert Pixeltable's generic tool schema to OpenAI-compatible format.
         model_kwargs['tools'] = [{'type': 'function', 'function': tool} for tool in tools]
 
     if tool_choice is not None:
+        # Map Pixeltable's unified tool_choice dict to OpenAI-compatible format.
         if tool_choice['auto']:
             model_kwargs['tool_choice'] = 'auto'
         elif tool_choice['required']:
@@ -98,10 +108,12 @@ async def chat_completions(
             model_kwargs['tool_choice'] = {'type': 'function', 'function': {'name': tool_choice['tool']}}
 
     if tool_choice is not None and not tool_choice['parallel_tool_calls']:
+        # Disable parallel tool calls via extra_body (non-standard OpenAI extension).
         if 'extra_body' not in model_kwargs:
             model_kwargs['extra_body'] = {}
         model_kwargs['extra_body']['parallel_tool_calls'] = False
 
+    # Use with_raw_response to get the raw JSON for consistent dict return format.
     result = await _deepseek_client().chat.completions.with_raw_response.create(
         messages=messages, model=model, **model_kwargs
     )

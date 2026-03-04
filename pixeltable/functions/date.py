@@ -1,5 +1,13 @@
 """
-Pixeltable UDFs for `DateType`.
+Pixeltable UDFs for the ``DateType`` column type.
+
+Provides property accessors (year, month, day) and methods (weekday, isoformat, strftime,
+add_days, etc.) that mirror Python's ``datetime.date`` API. Each UDF has a corresponding
+``@<fn>.to_sql`` implementation that pushes the computation down to PostgreSQL using
+SQLAlchemy's ``sql.extract()`` or ``sql.func.*`` for efficient server-side evaluation.
+
+These are registered with ``is_property=True`` or ``is_method=True`` so they can be used
+as attribute/method syntax on date columns: ``t.date_col.year``, ``t.date_col.weekday()``.
 
 Usage example:
 ```python
@@ -17,12 +25,16 @@ import sqlalchemy as sql
 import pixeltable as pxt
 from pixeltable.utils.code import local_public_names
 
-_SQL_ZERO = sql.literal(0)
+_SQL_ZERO = sql.literal(0)  # Reusable SQL literal for arithmetic expressions
 
 # NOT YET SUPPORTED date +/- integer
 # NOT YET SUPPORTED date1 - date2 -> integer
 # NOT YET SUPPORTED timestamp(date)
 # NOT YET SUPPORTED date(timestamp)
+
+# Each UDF below follows the pattern:
+# 1. @pxt.udf(is_property=True) or @pxt.udf(is_method=True) defines the Python implementation
+# 2. @<fn>.to_sql defines the SQL push-down using PostgreSQL's EXTRACT or built-in functions
 
 
 @pxt.udf(is_property=True)

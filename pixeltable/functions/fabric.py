@@ -154,9 +154,10 @@ async def chat_completions(
     # Build payload
     payload: dict[str, Any] = {'messages': messages}
 
-    # Handle reasoning vs standard models
+    # Handle reasoning vs standard models: reasoning models (e.g., gpt-5) have a
+    # different parameter contract -- they use max_completion_tokens instead of max_tokens
+    # and do not support the temperature parameter.
     if _is_reasoning_model(model):
-        # Reasoning models use max_completion_tokens, no temperature
         # Extract max_tokens if present and convert to max_completion_tokens
         if 'max_tokens' in model_kwargs:
             payload['max_completion_tokens'] = model_kwargs.pop('max_tokens')
@@ -184,6 +185,8 @@ async def chat_completions(
         return response.json()
 
 
+# batch_size=32 means Pixeltable will batch up to 32 text inputs into a single API call,
+# reducing the number of HTTP round-trips for embedding generation.
 @pxt.udf(batch_size=32, resource_pool='request-rate:fabric:embeddings')
 async def embeddings(
     input: Batch[str],

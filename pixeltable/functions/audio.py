@@ -1,5 +1,13 @@
 """
-Pixeltable UDFs for `AudioType`.
+Pixeltable UDFs for the ``AudioType`` column type.
+
+This module provides operations on audio files, including:
+- ``get_metadata``: Extracts codec, duration, sample rate, and other metadata from audio files.
+- ``encode_audio``: Converts raw audio arrays (numpy) into encoded audio files (wav, mp3, flac, mp4).
+- ``audio_splitter``: An iterator that splits audio files into fixed-duration segments with optional
+  overlap, used to create views for downstream processing (e.g., transcription).
+
+These functions operate on local audio files via PyAV (``av`` library).
 """
 
 import logging
@@ -96,6 +104,8 @@ def encode_audio(
     codec, ext = av_utils.AUDIO_FORMATS[format]
     output_path = str(TempStore.create_path(extension=f'.{ext}'))
 
+    # Determine audio layout (mono/stereo) and reshape the numpy array
+    # to the interleaved format that PyAV expects for encoding.
     match audio_data.shape:
         case (_,):
             # Mono audio as 1D array, reshape for pyav
@@ -185,6 +195,8 @@ class audio_splitter(pxt.PxtIterator[AudioSegment]):
     # Each segment is defined by start and end presentation timestamps in audio file (int)
     segments_to_extract_in_pts: list[tuple[int, int]] | None
 
+    # Maps decoder codec names to their corresponding encoder codec names for PyAV.
+    # When splitting audio, the output segment must be re-encoded with a compatible encoder.
     __codec_map: ClassVar[dict[str, str]] = {
         'mp3': 'mp3',  # MP3 decoder -> mp3/libmp3lame encoder
         'mp3float': 'mp3',  # MP3float decoder -> mp3 encoder

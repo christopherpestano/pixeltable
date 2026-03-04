@@ -1,3 +1,23 @@
+"""QueryTemplateFunction -- parameterized queries that can be called as functions.
+
+This module implements Pixeltable's ``@pxt.query`` decorator and the ``retrieval_udf``
+helper. A QueryTemplateFunction wraps a parameterized Query object: when called with
+arguments, it binds the parameters and executes the query.
+
+Architecture:
+    - The ``@pxt.query`` decorator takes a Python function that returns a ``Query``
+      (the Pixeltable equivalent of a DataFrame). The decorator calls the function with
+      Variable expressions as arguments to capture the query template.
+    - At call time, ``aexec()`` binds the actual arguments to the template and
+      executes the query asynchronously.
+    - ``retrieval_udf()`` is a convenience function that creates a QueryTemplateFunction
+      for simple equality-based lookups on a table. This is commonly used for
+      LLM tool integration, where a tool needs to retrieve matching rows.
+
+QueryTemplateFunctions always return ``JsonType`` (a list of dicts), and are always async
+(they execute queries via the async runtime).
+"""
+
 from __future__ import annotations
 
 import inspect
@@ -14,7 +34,18 @@ if TYPE_CHECKING:
 
 
 class QueryTemplateFunction(Function):
-    """A parameterized query from which an executable Query is created with a function call."""
+    """A parameterized query from which an executable Query is created with a function call.
+
+    A QueryTemplateFunction wraps a Query object that contains Variable expressions
+    as placeholders. When called, it substitutes actual values for these variables
+    and executes the query, returning a list of result dicts.
+
+    Attributes:
+        template_df: The parameterized Query containing Variable placeholders.
+            None is allowed during deserialization edge cases.
+        self_name: The display name of this query function.
+        _comment: Optional docstring/description.
+    """
 
     template_df: 'Query' | None
     self_name: str | None
@@ -24,6 +55,21 @@ class QueryTemplateFunction(Function):
     def create(
         cls, template_callable: Callable, param_types: list[ts.ColumnType] | None, path: str, name: str
     ) -> QueryTemplateFunction:
+        """Create a QueryTemplateFunction by invoking a callable with Variable expressions.
+
+        Calls the user's function with Variable-typed arguments to capture the
+        Query template, then wraps it in a QueryTemplateFunction with the
+        inferred signature.
+
+        Args:
+            template_callable: The user's function that returns a Query.
+            param_types: Optional explicit parameter types.
+            path: The fully-qualified path of the function (for serialization).
+            name: The display name.
+
+        Returns:
+            A QueryTemplateFunction instance.
+        """
         # we need to construct a template df and a signature
         py_sig = inspect.signature(template_callable)
         py_params = list(py_sig.parameters.values())
@@ -60,6 +106,7 @@ class QueryTemplateFunction(Function):
         return True
 
     async def aexec(self, *args: Any, **kwargs: Any) -> Any:
+        """Execute the query by binding arguments and collecting results asynchronously."""
         # assert not self.is_polymorphic
         bound_args = self.signature.py_signature.bind(*args, **kwargs).arguments
         # apply defaults, otherwise we might have Parameters left over
