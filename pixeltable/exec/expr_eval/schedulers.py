@@ -7,7 +7,7 @@ import logging
 import math
 import sys
 import time
-from typing import Awaitable, Collection
+from typing import Any, Awaitable, Collection
 
 from pixeltable import env, func
 from pixeltable.config import Config
@@ -17,7 +17,7 @@ from .globals import Dispatcher, ExprEvalCtx, FnCallArgs, Scheduler
 
 _logger = logging.getLogger('pixeltable')
 
-__all__ = ['RateLimitsScheduler', 'RequestRateScheduler']
+__all__ = ['RateLimitsScheduler', 'RayScheduler', 'RequestRateScheduler']
 
 
 class RateLimitsScheduler(Scheduler):
@@ -422,5 +422,120 @@ class RequestRateScheduler(Scheduler):
             return exponential_backoff(num_retries, max_delay=self.MAX_RETRY_DELAY)
 
 
+class RayScheduler(Scheduler):
+    """
+    Scheduler that offloads FunctionCall execution to a Ray cluster.
+
+    Falls back to local execution when Ray is not installed or not configured.
+    Matches resource pools 'ray' or 'ray:<qualifier>'.
+    """
+
+    ray: Any  # ray module or None for local fallback
+    _remote_fn_cache: dict[int, Any]  # id(py_fn) -> ray.remote wrapped fn
+
+    MAX_RETRIES = 3
+
+    def __init__(self, resource_pool: str, dispatcher: Dispatcher):
+        super().__init__(resource_pool, dispatcher)
+        self.ray = env.Env.get().get_ray_module()
+        self._remote_fn_cache = {}
+        self.total_requests = 0
+
+        # Parse optional per-pool num_cpus/num_gpus from config
+        config = Config.get()
+        num_cpus_val = config.get_int_value('num_cpus', section='ray')
+        num_gpus_val = config.get_int_value('num_gpus', section='ray')
+        self._num_cpus: int = num_cpus_val if num_cpus_val is not None else 1
+        self._num_gpus: int = num_gpus_val if num_gpus_val is not None else 0
+
+        loop_task = asyncio.create_task(self._main_loop())
+        self.dispatcher.register_task(loop_task)
+
+        mode = 'remote (Ray)' if self.ray is not None else 'local fallback'
+        _logger.info(f'RayScheduler initialized for pool {resource_pool!r} in {mode} mode')
+
+    @classmethod
+    def matches(cls, resource_pool: str) -> bool:
+        return resource_pool == 'ray' or resource_pool.startswith('ray:')
+
+    def _get_remote_fn(self, py_fn: Any) -> Any:
+        """Wrap a Python function with ray.remote, caching the result."""
+        fn_id = id(py_fn)
+        if fn_id not in self._remote_fn_cache:
+            remote_fn = self.ray.remote(num_cpus=self._num_cpus, num_gpus=self._num_gpus)(py_fn)
+            self._remote_fn_cache[fn_id] = remote_fn
+        return self._remote_fn_cache[fn_id]
+
+    async def _main_loop(self) -> None:
+        while True:
+            item = await self.queue.get()
+            task = asyncio.create_task(self._exec(item.request, item.exec_ctx, item.num_retries))
+            self.dispatcher.register_task(task)
+
+    async def _exec(self, request: FnCallArgs, exec_ctx: ExprEvalCtx, num_retries: int) -> None:
+        assert all(not row.has_val[request.fn_call.slot_idx] for row in request.rows)
+        assert all(not row.has_exc(request.fn_call.slot_idx) for row in request.rows)
+
+        try:
+            pxt_fn = request.fn_call.fn
+            assert isinstance(pxt_fn, func.CallableFunction)
+            self.total_requests += 1
+            start_ts = datetime.datetime.now(tz=datetime.timezone.utc)
+            _logger.debug(
+                f'RayScheduler {self.resource_pool}: '
+                f'start evaluating slot {request.fn_call.slot_idx}, batch_size={len(request.rows)}'
+            )
+
+            if self.ray is None:
+                # Local fallback: execute directly, mirroring FnCallEvaluator patterns
+                if request.is_batched:
+                    if pxt_fn.is_async:
+                        result = await pxt_fn.aexec_batch(*request.batch_args, **request.batch_kwargs)
+                    else:
+                        result = pxt_fn.exec_batch(request.batch_args, request.batch_kwargs)
+                    assert len(result) == len(request.rows)
+                    for row, val in zip(request.rows, result):
+                        row[request.fn_call.slot_idx] = val
+                else:
+                    if pxt_fn.is_async:
+                        val = await pxt_fn.aexec(*request.args, **request.kwargs)
+                    else:
+                        val = pxt_fn.py_fn(*request.args, **request.kwargs)
+                    request.row[request.fn_call.slot_idx] = val
+            # Ray remote execution
+            elif request.is_batched:
+                if pxt_fn.is_async:
+                    remote_fn = self._get_remote_fn(pxt_fn.aexec_batch)
+                else:
+                    remote_fn = self._get_remote_fn(pxt_fn.exec_batch)
+                if pxt_fn.is_async:
+                    obj_ref = remote_fn.remote(*request.batch_args, **request.batch_kwargs)
+                else:
+                    obj_ref = remote_fn.remote(request.batch_args, request.batch_kwargs)
+                result = await asyncio.wrap_future(obj_ref.future())
+                assert len(result) == len(request.rows)
+                for row, val in zip(request.rows, result):
+                    row[request.fn_call.slot_idx] = val
+            else:
+                remote_fn = self._get_remote_fn(pxt_fn.py_fn)
+                obj_ref = remote_fn.remote(*request.args, **request.kwargs)
+                val = await asyncio.wrap_future(obj_ref.future())
+                request.row[request.fn_call.slot_idx] = val
+
+            end_ts = datetime.datetime.now(tz=datetime.timezone.utc)
+            _logger.debug(
+                f'RayScheduler {self.resource_pool}: evaluated slot {request.fn_call.slot_idx} '
+                f'in {end_ts - start_ts}, batch_size={len(request.rows)}'
+            )
+            self.dispatcher.dispatch(request.rows, exec_ctx)
+
+        except Exception as exc:
+            _logger.exception(f'RayScheduler {self.resource_pool}: exception in slot {request.fn_call.slot_idx}: {exc}')
+            _, _, exc_tb = sys.exc_info()
+            for row in request.rows:
+                row.set_exc(request.fn_call.slot_idx, exc)
+            self.dispatcher.dispatch_exc(request.rows, request.fn_call.slot_idx, exc_tb, exec_ctx)
+
+
 # all concrete Scheduler subclasses that implement matches()
-SCHEDULERS = [RateLimitsScheduler, RequestRateScheduler]
+SCHEDULERS = [RateLimitsScheduler, RayScheduler, RequestRateScheduler]

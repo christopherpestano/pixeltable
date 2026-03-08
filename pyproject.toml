@@ -195,6 +195,7 @@ extra-dev = [
     # This is for dependencies that will be installed locally for devs (via `make install`), but not in CI.
     "llama-cpp-python>=0.3.16 ; sys_platform != 'win32'"
 ]
+ray = ["ray[default]>=2.0"]
 storage-sdks = [
     # Used for CI configurations that need only the storage SDKs (in addition to basic dependencies).
     "boto3==1.36.23",

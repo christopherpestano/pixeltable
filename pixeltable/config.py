@@ -216,6 +216,13 @@ KNOWN_CONFIG_OPTIONS = {
     'veo': {'rate_limits': 'Per-model rate limits for Veo API requests'},
     'voyage': {'api_key': 'Voyage AI API key', 'rate_limit': 'Rate limit for Voyage AI API requests'},
     'pypi': {'api_key': 'PyPI API key (for internal use only)'},
+    'ray': {
+        'address': 'Ray cluster address (e.g., "auto", "ray://host:10001")',
+        'namespace': 'Ray namespace (optional)',
+        'num_cpus': 'CPUs per remote task (optional, default: 1)',
+        'num_gpus': 'GPUs per remote task (optional, default: 0)',
+        'runtime_env': 'JSON-serialized Ray runtime_env dict (optional)',
+    },
 }
 
 KNOWN_CONFIG_OVERRIDES = {

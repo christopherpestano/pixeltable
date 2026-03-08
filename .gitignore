@@ -16,6 +16,12 @@ __pycache__
 /target/
 /tests/target/
 
+# Terraform
+*.tfstate
+*.tfstate.backup
+.terraform/
+.terraform.lock.hcl
+
 # Node.js
 node_modules/
 package-lock.json

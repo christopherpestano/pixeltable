@@ -149,6 +149,12 @@ class FnCallEvaluator(Evaluator):
                     task = asyncio.create_task(self.eval_async(item))
                     self.dispatcher.register_task(task)
 
+        elif self.fn_call.resource_pool is not None:
+            # hand the call off to the resource pool's scheduler
+            scheduler = self.dispatcher.schedulers[self.fn_call.resource_pool]
+            for item in rows_call_args:
+                scheduler.submit(item, self.eval_ctx)
+
         else:
             # create a single task for all rows
             task = asyncio.create_task(self.eval(rows_call_args))

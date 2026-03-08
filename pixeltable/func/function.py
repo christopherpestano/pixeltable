@@ -328,10 +328,13 @@ class Function(ABC):
     def using(self, **kwargs: Any) -> 'ExprTemplateFunction':
         from .expr_template_function import ExprTemplateFunction
 
+        # Extract resource_pool override before passing to _bind_and_create_template
+        resource_pool_override = kwargs.pop('resource_pool', None)
+
         assert len(self.signatures) > 0
         if len(self.signatures) == 1:
             # Only one signature: call _bind_and_create_template() and surface any errors directly
-            template = self._bind_and_create_template(kwargs)
+            template = self._bind_and_create_template(kwargs, resource_pool_override=resource_pool_override)
             return ExprTemplateFunction([template])
         else:
             # Multiple signatures: iterate over each signature and generate a template for each
@@ -341,7 +344,9 @@ class Function(ABC):
             templates: list['ExprTemplate'] = []
             for i in range(len(self.signatures)):
                 try:
-                    template = self._resolved_fns[i]._bind_and_create_template(kwargs)
+                    template = self._resolved_fns[i]._bind_and_create_template(
+                        kwargs, resource_pool_override=resource_pool_override
+                    )
                     templates.append(template)
                 except (TypeError, excs.Error):
                     continue
@@ -349,7 +354,9 @@ class Function(ABC):
                 raise excs.Error(f'Function {self.name!r} has no matching signature for arguments')
             return ExprTemplateFunction(templates)
 
-    def _bind_and_create_template(self, kwargs: dict[str, Any]) -> 'ExprTemplate':
+    def _bind_and_create_template(
+        self, kwargs: dict[str, Any], resource_pool_override: str | None = None
+    ) -> 'ExprTemplate':
         from pixeltable import exprs
 
         from .expr_template_function import ExprTemplate
@@ -395,6 +402,10 @@ class Function(ABC):
 
         return_type = self.call_return_type(bindings)
         call = exprs.FunctionCall(self, template_args, template_kwargs, return_type)
+
+        # Override the resource pool if specified via .using(resource_pool=...)
+        if resource_pool_override is not None:
+            call.resource_pool = resource_pool_override
 
         # Construct the (n-k)-ary signature of the new function. We use `call.col_type` for this, rather than
         # `self.signature.return_type`, because the return type of the new function may be specialized via a

@@ -42,6 +42,17 @@ _logger = logging.getLogger('pixeltable')
 T = TypeVar('T')
 
 
+def _is_ray_worker() -> bool:
+    """Return True if running inside a Ray worker process (not the driver)."""
+    try:
+        import ray
+        if ray.is_initialized():
+            return not ray.get_runtime_context().worker.is_driver
+    except Exception:
+        pass
+    return False
+
+
 class Env:
     """
     Store runtime globals for both local and non-local environments.
@@ -97,7 +108,10 @@ class Env:
         # hit the assertion in _init_env())
         with cls._init_lock:
             if cls._instance is None:
-                cls._init_env()
+                if _is_ray_worker():
+                    cls._init_worker_env()
+                else:
+                    cls._init_env()
         return cls._instance
 
     @classmethod
@@ -116,6 +130,18 @@ class Env:
             # Reset the initializing flag, even if setup fails.
             # This prevents the environment from being left in a broken state.
             cls.__initializing = False
+
+    @classmethod
+    def _init_worker_env(cls) -> None:
+        """Initialize a lightweight Env for Ray workers.
+
+        Only populates the optional-packages registry so require_package()
+        and require_binary() work. Skips database, directories, logging,
+        and HTTP server.
+        """
+        env = Env()
+        env._Env__register_packages()
+        cls._instance = env
 
     def __init__(self) -> None:
         assert self._instance is None, 'Env is a singleton; use Env.get() to access the instance'
@@ -154,6 +180,10 @@ class Env:
         self._resource_pool_info = {}
         self._resource_pool_lock = threading.Lock()
         self._dbms = None
+
+        # Ray-related state
+        self._ray_initialized: bool = False
+        self._ray_module: Any | None = None
 
     @property
     def db_url(self) -> str:
@@ -822,6 +852,54 @@ class Env:
                 info = make_pool_info()
                 self._resource_pool_info[pool_id] = info
             return info
+
+    def get_ray_module(self) -> Any | None:
+        """Returns the ray module if Ray is installed and configured, None otherwise.
+
+        Attempts to import ray and connect to the cluster specified in config.
+        Caches the result so subsequent calls are fast. Returns None (local fallback)
+        if ray is not installed or no ray.address is configured.
+        """
+        if self._ray_initialized:
+            return self._ray_module
+
+        self._ray_initialized = True
+        try:
+            import ray  # type: ignore[import-not-found]
+        except ImportError:
+            _logger.info('Ray is not installed; UDFs with resource_pool="ray" will run locally')
+            return None
+
+        config = Config.get()
+        address = config.get_string_value('address', section='ray')
+        if address is None:
+            _logger.info('No ray.address configured; UDFs with resource_pool="ray" will run locally')
+            return None
+
+        namespace = config.get_string_value('namespace', section='ray')
+        runtime_env_str = config.get_string_value('runtime_env', section='ray')
+        runtime_env = None
+        if runtime_env_str is not None:
+            import json
+
+            runtime_env = json.loads(runtime_env_str)
+
+        try:
+            init_kwargs: dict[str, Any] = {'address': address, 'ignore_reinit_error': True}
+            if namespace is not None:
+                init_kwargs['namespace'] = namespace
+            if runtime_env is not None:
+                init_kwargs['runtime_env'] = runtime_env
+            ray.init(**init_kwargs)
+            self._ray_module = ray
+            _logger.info(f'Connected to Ray cluster at {address}')
+        except Exception as e:
+            _logger.error(
+                f'Failed to connect to Ray cluster at {address}; falling back to local execution: {e}',
+                exc_info=True,
+            )
+
+        return self._ray_module
 
     @property
     def media_dir(self) -> Path:
