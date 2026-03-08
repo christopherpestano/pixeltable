@@ -1,0 +1,42 @@
+# Ray Cluster Launcher config — alternative to Terraform.
+# Usage:
+#   ray up ray-cluster.yaml
+#   ray down ray-cluster.yaml
+
+cluster_name: pixeltable-gpu
+
+provider:
+  type: aws
+  region: us-east-1
+
+auth:
+  ssh_user: ec2-user
+  # ssh_private_key: ~/.ssh/your-key.pem  # Uncomment and set your key path
+
+available_node_types:
+  head:
+    min_workers: 0
+    max_workers: 0
+    node_config:
+      InstanceType: g4dn.xlarge
+      InstanceMarketOptions:
+        MarketType: spot
+        SpotOptions:
+          MaxPrice: "0.25"
+      ImageId: ""  # Leave empty — Ray auto-selects a DLAMI
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 100
+            VolumeType: gp3
+
+head_node_type: head
+
+setup_commands:
+  - source /home/ec2-user/anaconda3/bin/activate pytorch
+  - pip install --no-cache-dir 'ray[default]' pixeltable torch diffusers transformers accelerate
+  - touch /home/ec2-user/ray-ready
+
+head_start_ray_commands:
+  - ray stop
+  - ray start --head --port=6379 --ray-client-server-port=10001 --dashboard-host=0.0.0.0 --dashboard-port=8265
