@@ -45,6 +45,8 @@ class ColumnType:
         DATE = 11
         UUID = 12
         BINARY = 13
+        GEOMETRY = 14
+        RASTER = 15
 
         # exprs that don't evaluate to a computable value in Pixeltable, such as an Image member function
         INVALID = 255
@@ -166,6 +168,8 @@ class ColumnType:
                 return UUIDType()
             case cls.Type.BINARY:
                 return BinaryType()
+            case cls.Type.GEOMETRY:
+                return GeometryType()
             case _:
                 raise AssertionError(t)
 
@@ -268,6 +272,13 @@ class ColumnType:
             col_type = ArrayType.from_literal(val, nullable=nullable)
             if col_type is not None:
                 return col_type
+        try:
+            import shapely.geometry.base
+
+            if isinstance(val, shapely.geometry.base.BaseGeometry):
+                return GeometryType(nullable=nullable)
+        except ImportError:
+            pass
         # this could still be json-serializable
         if isinstance(val, (list, tuple, dict, np.ndarray, pydantic.BaseModel)):
             try:
@@ -552,6 +563,12 @@ class ColumnType:
     def is_document_type(self) -> bool:
         return self._type == self.Type.DOCUMENT
 
+    def is_geometry_type(self) -> bool:
+        return self._type == self.Type.GEOMETRY
+
+    def is_raster_type(self) -> bool:
+        return self._type == self.Type.RASTER
+
     def is_media_type(self) -> bool:
         # types that refer to external media files
         return self.is_image_type() or self.is_video_type() or self.is_audio_type() or self.is_document_type()
@@ -802,6 +819,88 @@ class BinaryType(ColumnType):
     def _validate_literal(self, val: Any) -> None:
         if not isinstance(val, bytes):
             raise TypeError(f'Expected `bytes`, got `{val.__class__.__name__}`')
+
+
+class GeometryType(ColumnType):
+    # OGC Simple Features / GeoJSON RFC 7946.
+    # geom_type constrains the top-level type only; nesting is implicit
+    # (e.g. MultiPolygon always contains Polygons, GeometryCollection can contain any mix).
+    GEOM_TYPES = frozenset(
+        {'POINT', 'LINESTRING', 'POLYGON', 'MULTIPOINT', 'MULTILINESTRING', 'MULTIPOLYGON', 'GEOMETRYCOLLECTION'}
+    )
+
+    def __init__(self, geom_type: str | None = None, nullable: bool = False):
+        super().__init__(self.Type.GEOMETRY, nullable=nullable)
+        if geom_type is not None:
+            geom_type = geom_type.upper()
+            if geom_type not in self.GEOM_TYPES:
+                raise excs.Error(f'Invalid geometry type: {geom_type}')
+        self.geom_type = geom_type
+
+    @classmethod
+    def to_sa_type(cls) -> sql.types.TypeEngine:
+        return sql.dialects.postgresql.JSONB()
+
+    def copy(self, nullable: bool) -> ColumnType:
+        return GeometryType(geom_type=self.geom_type, nullable=nullable)
+
+    def matches(self, other: ColumnType) -> bool:
+        return isinstance(other, GeometryType) and self.geom_type == other.geom_type
+
+    def supertype(self, other: ColumnType, for_inference: bool = False) -> GeometryType | None:
+        if not isinstance(other, GeometryType):
+            return None
+        geom_type = self.geom_type if self.geom_type == other.geom_type else None
+        return GeometryType(geom_type=geom_type, nullable=self.nullable or other.nullable)
+
+    def __hash__(self) -> int:
+        return hash((self._type, self.nullable, self.geom_type))
+
+    def _to_base_str(self) -> str:
+        if self.geom_type is not None:
+            return f'Geometry[{self.geom_type}]'
+        return 'Geometry'
+
+    def _as_dict(self) -> dict:
+        result = super()._as_dict()
+        result['geom_type'] = self.geom_type
+        return result
+
+    @classmethod
+    def _from_dict(cls, d: dict) -> ColumnType:
+        return cls(geom_type=d.get('geom_type'), nullable=d['nullable'])
+
+    def _validate_literal(self, val: Any) -> None:
+        try:
+            import shapely.geometry.base
+
+            if isinstance(val, shapely.geometry.base.BaseGeometry):
+                return
+        except ImportError:
+            pass
+        if isinstance(val, dict):
+            if 'type' not in val:
+                raise TypeError("GeoJSON dict must have a 'type' key")
+            geom_type = val['type']
+            if geom_type == 'GeometryCollection':
+                if 'geometries' not in val:
+                    raise TypeError("GeometryCollection must have a 'geometries' key")
+            elif 'coordinates' not in val:
+                raise TypeError(f"GeoJSON {geom_type} must have a 'coordinates' key")
+            return
+        raise TypeError(f'Expected shapely geometry or GeoJSON dict, got {type(val).__name__}')
+
+    def _create_literal(self, val: Any) -> Any:
+        try:
+            import shapely.geometry.base
+
+            if isinstance(val, shapely.geometry.base.BaseGeometry):
+                import shapely.geometry
+
+                return shapely.geometry.mapping(val)
+        except ImportError:
+            pass
+        return val
 
 
 class JsonType(ColumnType):
@@ -1567,6 +1666,17 @@ class Document(str, _PxtType):
         return DocumentType(nullable=nullable)
 
 
+class Geometry(_PxtType):
+    def __class_getitem__(cls, item: Any) -> _AnnotatedAlias:
+        if isinstance(item, str):
+            return typing.Annotated[dict, GeometryType(geom_type=item, nullable=False)]
+        raise TypeError(f'Geometry type parameter must be a string, got {type(item).__name__}')
+
+    @classmethod
+    def as_col_type(cls, nullable: bool) -> ColumnType:
+        return GeometryType(nullable=nullable)
+
+
 ALL_PIXELTABLE_TYPES = (
     String,
     Bool,
@@ -1582,4 +1692,5 @@ ALL_PIXELTABLE_TYPES = (
     Date,
     UUID,
     Binary,
+    Geometry,
 )

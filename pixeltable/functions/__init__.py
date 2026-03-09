@@ -20,6 +20,7 @@ from . import (
     fal,
     fireworks,
     gemini,
+    geometry,
     groq,
     huggingface,
     image,

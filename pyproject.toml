@@ -70,6 +70,8 @@ dependencies = [
     "aiohttp>=3.10",
     "deprecated>=1.2.15",
     "pypdfium2>=4.30.0",
+    "shapely>=2.0",
+    "geopandas>=0.14",
 ]
 
 [project.urls]
@@ -111,6 +113,8 @@ dev = [
     "pandas-stubs>=2.0",
     "pyarrow-stubs>=19",
     "types-beautifulsoup4>=4.2",
+    "types-geopandas>=1.1",
+    "types-shapely>=2.0",
     "types-deprecated>=1.2.15",
     "types-jmespath>=1.0",
     "types-jsonschema>=4.1.0",

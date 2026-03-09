@@ -25,6 +25,7 @@ from pixeltable.utils.description_helper import DescriptionHelper
 from pixeltable.utils.formatter import Formatter
 
 if TYPE_CHECKING:
+    import geopandas
     import torch.utils.data
 
 __all__ = ['Query']
@@ -71,6 +72,27 @@ class ResultSet:
 
     def to_pandas(self) -> pd.DataFrame:
         return pd.DataFrame.from_records(self._rows, columns=self._col_names)
+
+    def to_geodataframe(self, geometry_col: str | None = None) -> 'geopandas.GeoDataFrame':
+        """Convert this result set to a GeoDataFrame.
+
+        Auto-detects the geometry column if there is exactly one.
+
+        Args:
+            geometry_col: Name of the geometry column. If ``None``, the first
+                geometry column found in the schema is used.
+        """
+        import geopandas
+        from shapely.geometry import shape as _shape
+
+        df = self.to_pandas()
+        geom_cols = [name for name, ct in self.__schema.items() if ct.is_geometry_type()]
+        if geometry_col is None:
+            if len(geom_cols) == 0:
+                raise excs.Error('No geometry columns found in result set')
+            geometry_col = geom_cols[0]
+        df[geometry_col] = df[geometry_col].apply(lambda x: _shape(x) if x is not None else None)  # type: ignore[arg-type,return-value]
+        return geopandas.GeoDataFrame(df, geometry=geometry_col)
 
     BaseModelT = TypeVar('BaseModelT', bound=pydantic.BaseModel)
 

@@ -24,6 +24,7 @@ class PxtPlugin(Plugin):
         pxt.Video: 'builtins.str',
         pxt.Audio: 'builtins.str',
         pxt.Document: 'builtins.str',
+        pxt.Geometry: 'typing.Any',
     }
     __FULLNAME_MAP: ClassVar[dict] = {f'{k.__module__}.{k.__name__}': v for k, v in __TYPE_MAP.items()}
 

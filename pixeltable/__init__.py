@@ -66,6 +66,7 @@ from .type_system import (
     Date,
     Document,
     Float,
+    Geometry,
     Image,
     Int,
     Json,
