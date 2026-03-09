@@ -23,6 +23,7 @@ from .object_ref import ObjectRef
 from .row_builder import ColumnSlotIdx, ExecProfile, RowBuilder
 from .rowid_ref import RowidRef
 from .similarity_expr import SimilarityExpr
+from .spatial_predicate import SpatialOp, SpatialPredicate
 from .sql_element_cache import SqlElementCache
 from .string_op import StringOp
 from .type_cast import TypeCast

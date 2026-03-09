@@ -1069,6 +1069,100 @@ class Table(SchemaObject):
             # TODO: how to deal with exceptions here? drop the index and raise?
             FileCache.get().emit_eviction_warnings()
 
+    def add_spatial_index(
+        self,
+        column: str | ColumnRef,
+        *,
+        idx_name: str | None = None,
+        srid: int = 4326,
+        if_exists: Literal['error', 'ignore', 'replace', 'replace_force'] = 'error',
+    ) -> None:
+        """Add a PostGIS spatial index (GiST) to a Geometry column.
+
+        A spatial index enables efficient evaluation of spatial predicates
+        (:meth:`~pixeltable.exprs.ColumnRef.st_intersects`,
+        :meth:`~pixeltable.exprs.ColumnRef.st_contains`,
+        :meth:`~pixeltable.exprs.ColumnRef.st_within`,
+        :meth:`~pixeltable.exprs.ColumnRef.st_dwithin`) by pushing them down to PostGIS SQL.
+
+        Without a spatial index, spatial predicates still work but are evaluated in Python using Shapely.
+
+        Requires the PostGIS extension to be available on the PostgreSQL server.
+
+        Args:
+            column: The name of, or reference to, a Geometry column.
+            idx_name: Optional name for the index. Auto-generated if not specified.
+            srid: Spatial Reference System Identifier. Default is 4326 (WGS84 / GPS coordinates).
+            if_exists: How to handle an existing index with the same name:
+                ``'error'``, ``'ignore'``, ``'replace'``, or ``'replace_force'``.
+
+        Raises:
+            Error: If the column is not a Geometry column.
+            RuntimeError: If PostGIS is not available on the database server.
+
+        Examples:
+            Add a spatial index to the ``geom`` column:
+
+            >>> tbl.add_spatial_index('geom')
+
+            Spatial predicates are now accelerated via PostGIS:
+
+            >>> from shapely.geometry import box
+            >>> tbl.where(tbl.geom.st_intersects(box(0, 0, 10, 10))).collect()
+        """
+        from pixeltable.utils.postgis import ensure_postgis
+
+        ensure_postgis()
+
+        with get_runtime().catalog.begin_xact(tbl=self._tbl_version_path, for_write=True, lock_mutable_tree=True):
+            self.__check_mutable('add an index to')
+            col = self._resolve_column_parameter(column)
+
+            if idx_name is not None and idx_name in self._tbl_version.get().idxs_by_name:
+                if_exists_ = IfExistsParam.validated(if_exists, 'if_exists')
+                if if_exists_ == IfExistsParam.ERROR:
+                    raise excs.Error(f'Duplicate index name: {idx_name}')
+                if not isinstance(self._tbl_version.get().idxs_by_name[idx_name].idx, index.SpatialIndex):
+                    raise excs.Error(f'Index {idx_name!r} is not a spatial index. Cannot {if_exists_.name.lower()} it.')
+                if if_exists_ == IfExistsParam.IGNORE:
+                    return
+                assert if_exists_ in (IfExistsParam.REPLACE, IfExistsParam.REPLACE_FORCE)
+                self.drop_index(idx_name=idx_name)
+                assert idx_name not in self._tbl_version.get().idxs_by_name
+
+            if idx_name is not None:
+                Column.validate_name(idx_name)
+
+            idx = index.SpatialIndex(srid=srid)
+            _ = idx.create_value_expr(col)
+            _ = self._tbl_version.get().add_index(col, idx_name=idx_name, idx=idx)
+
+    def drop_spatial_index(
+        self,
+        *,
+        column: str | ColumnRef | None = None,
+        idx_name: str | None = None,
+        if_not_exists: Literal['error', 'ignore'] = 'error',
+    ) -> None:
+        """Drop a spatial index from the table.
+
+        Either ``column`` or ``idx_name`` (but not both) must be provided.
+
+        Args:
+            column: The column from which to drop the spatial index.
+            idx_name: The name of the index to drop.
+            if_not_exists: ``'error'`` to raise on missing index, ``'ignore'`` to silently skip.
+        """
+        if (column is None) == (idx_name is None):
+            raise excs.Error("Exactly one of 'column' or 'idx_name' must be provided")
+
+        with get_runtime().catalog.begin_xact(tbl=self._tbl_version_path, for_write=True, lock_mutable_tree=True):
+            col: Column = None
+            if idx_name is None:
+                col = self._resolve_column_parameter(column)
+                assert col is not None
+            self._drop_index(col=col, idx_name=idx_name, _idx_class=index.SpatialIndex, if_not_exists=if_not_exists)
+
     def drop_embedding_index(
         self,
         *,

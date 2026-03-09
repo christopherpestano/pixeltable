@@ -1,6 +1,6 @@
 import folium
 import pytest
-from shapely.geometry import MultiPolygon, Point, Polygon, shape
+from shapely.geometry import MultiPolygon, Point, Polygon, box, shape
 
 import pixeltable as pxt
 import pixeltable.type_system as ts
@@ -296,3 +296,177 @@ class TestGeometryVisualization:
         t.insert([{'geom': Point(0, 0), 'label': 'a', 'val': 1}])
         m = t.collect().show_map()
         assert isinstance(m, folium.Map)
+
+
+class TestPostGISDetection:
+    def test_postgis_available_returns_bool(self, uses_db: None) -> None:
+        from pixeltable.utils.postgis import postgis_available, reset_cache
+
+        reset_cache()
+        result = postgis_available()
+        assert isinstance(result, bool)
+        # calling again returns the cached value
+        assert postgis_available() == result
+
+    def test_ensure_postgis_raises_when_unavailable(self, uses_db: None) -> None:
+        from pixeltable.utils.postgis import ensure_postgis, postgis_available
+
+        if postgis_available():
+            pytest.skip('PostGIS is available, cannot test unavailable path')
+        with pytest.raises(RuntimeError, match='PostGIS is not available'):
+            ensure_postgis()
+
+    def test_add_spatial_index_raises_when_no_postgis(self, uses_db: None) -> None:
+        from pixeltable.utils.postgis import postgis_available
+
+        if postgis_available():
+            pytest.skip('PostGIS is available, cannot test unavailable path')
+        t = pxt.create_table('test_no_postgis', {'geom': pxt.Geometry})
+        t.insert([{'geom': Point(0, 0)}])
+        with pytest.raises(RuntimeError, match='PostGIS is not available'):
+            t.add_spatial_index('geom')
+
+
+class TestSpatialPredicateFallback:
+    """Tests for spatial predicates using Python/Shapely fallback (no spatial index required)."""
+
+    def test_st_intersects_python_fallback(self, uses_db: None) -> None:
+        t = pxt.create_table('test_sp_intersects', {'geom': pxt.Geometry, 'name': pxt.String})
+        p1 = Polygon([(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)])
+        p2 = Polygon([(20, 20), (30, 20), (30, 30), (20, 30), (20, 20)])
+        t.insert([{'geom': p1, 'name': 'overlapping'}, {'geom': p2, 'name': 'distant'}])
+
+        query_poly = Polygon([(5, 5), (15, 5), (15, 15), (5, 15), (5, 5)])
+        result = t.where(t.geom.st_intersects(query_poly)).collect()
+        assert len(result) == 1
+        assert result[0]['name'] == 'overlapping'
+
+    def test_st_contains_python_fallback(self, uses_db: None) -> None:
+        t = pxt.create_table('test_sp_contains', {'geom': pxt.Geometry, 'name': pxt.String})
+        big = Polygon([(0, 0), (100, 0), (100, 100), (0, 100), (0, 0)])
+        small = Polygon([(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)])
+        t.insert([{'geom': big, 'name': 'big'}, {'geom': small, 'name': 'small'}])
+
+        inner_point = {'type': 'Point', 'coordinates': [50, 50]}
+        result = t.where(t.geom.st_contains(inner_point)).collect()
+        assert len(result) == 1
+        assert result[0]['name'] == 'big'
+
+    def test_st_within_python_fallback(self, uses_db: None) -> None:
+        t = pxt.create_table('test_sp_within', {'geom': pxt.Geometry, 'name': pxt.String})
+        t.insert([{'geom': Point(5, 5), 'name': 'inside'}, {'geom': Point(50, 50), 'name': 'outside'}])
+
+        bounding_box = box(0, 0, 10, 10)
+        result = t.where(t.geom.st_within(bounding_box)).collect()
+        assert len(result) == 1
+        assert result[0]['name'] == 'inside'
+
+    def test_st_dwithin_python_fallback(self, uses_db: None) -> None:
+        t = pxt.create_table('test_sp_dwithin', {'geom': pxt.Geometry, 'name': pxt.String})
+        t.insert([{'geom': Point(1, 1), 'name': 'near'}, {'geom': Point(100, 100), 'name': 'far'}])
+
+        origin = Point(0, 0)
+        result = t.where(t.geom.st_dwithin(origin, distance=5.0)).collect()
+        assert len(result) == 1
+        assert result[0]['name'] == 'near'
+
+    def test_spatial_predicate_handles_null(self, uses_db: None) -> None:
+        t = pxt.create_table('test_sp_null', {'geom': pxt.Geometry, 'val': pxt.Int})
+        t.insert([{'geom': Point(0, 0), 'val': 1}, {'geom': None, 'val': 2}])
+
+        query_poly = box(-10, -10, 10, 10)
+        result = t.where(t.geom.st_intersects(query_poly)).collect()
+        assert len(result) == 1
+        assert result[0]['val'] == 1
+
+    def test_spatial_predicate_rejects_non_geometry(self) -> None:
+        """Spatial predicates should raise an error on non-geometry columns."""
+        from pixeltable.exprs.literal import Literal
+        from pixeltable.exprs.spatial_predicate import SpatialOp, SpatialPredicate
+
+        # Create a literal with a non-geometry type to test the validation
+        with pytest.raises(pxt.Error, match='Geometry column'):
+            SpatialPredicate(
+                Literal('hello', col_type=ts.StringType()),  # type: ignore[arg-type]
+                Literal({'type': 'Point', 'coordinates': [0, 0]}, col_type=ts.GeometryType()),
+                op=SpatialOp.INTERSECTS,
+            )
+
+    def test_spatial_predicate_with_geojson_dict(self, uses_db: None) -> None:
+        """Verify that GeoJSON dicts work as query geometries."""
+        t = pxt.create_table('test_sp_geojson', {'geom': pxt.Geometry})
+        t.insert([{'geom': Point(5, 5)}])
+
+        geojson_box = {'type': 'Polygon', 'coordinates': [[[0, 0], [10, 0], [10, 10], [0, 10], [0, 0]]]}
+        result = t.where(t.geom.st_within(geojson_box)).collect()
+        assert len(result) == 1
+
+
+class TestSpatialIndex:
+    """Tests for PostGIS spatial index creation and query pushdown.
+
+    These tests require PostGIS and are skipped when not available.
+    """
+
+    def _skip_without_postgis(self) -> None:
+        from pixeltable.utils.postgis import postgis_available
+
+        if not postgis_available():
+            pytest.skip('PostGIS not available')
+
+    def test_add_and_drop_spatial_index(self, uses_db: None) -> None:
+        self._skip_without_postgis()
+        t = pxt.create_table('test_si_basic', {'geom': pxt.Geometry})
+        t.insert([{'geom': Point(1, 2)}, {'geom': Point(3, 4)}])
+        t.add_spatial_index('geom')
+
+        indexes = t.list_indexes()
+        assert len(indexes) == 1
+        assert indexes[0]['_column'] == 'geom'
+
+        t.drop_spatial_index(column='geom')
+        assert len(t.list_indexes()) == 0
+
+    def test_spatial_index_accelerated_intersects(self, uses_db: None) -> None:
+        self._skip_without_postgis()
+        t = pxt.create_table('test_si_intersects', {'geom': pxt.Geometry, 'name': pxt.String})
+        p1 = Polygon([(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)])
+        p2 = Polygon([(20, 20), (30, 20), (30, 30), (20, 30), (20, 20)])
+        t.insert([{'geom': p1, 'name': 'near'}, {'geom': p2, 'name': 'far'}])
+        t.add_spatial_index('geom')
+
+        query_poly = Polygon([(5, 5), (15, 5), (15, 15), (5, 15), (5, 5)])
+        result = t.where(t.geom.st_intersects(query_poly)).collect()
+        assert len(result) == 1
+        assert result[0]['name'] == 'near'
+
+    def test_spatial_index_accelerated_within(self, uses_db: None) -> None:
+        self._skip_without_postgis()
+        t = pxt.create_table('test_si_within', {'geom': pxt.Geometry, 'name': pxt.String})
+        t.insert([{'geom': Point(5, 5), 'name': 'inside'}, {'geom': Point(50, 50), 'name': 'outside'}])
+        t.add_spatial_index('geom')
+
+        bounding_box = box(0, 0, 10, 10)
+        result = t.where(t.geom.st_within(bounding_box)).collect()
+        assert len(result) == 1
+        assert result[0]['name'] == 'inside'
+
+    def test_spatial_index_if_exists(self, uses_db: None) -> None:
+        self._skip_without_postgis()
+        t = pxt.create_table('test_si_exists', {'geom': pxt.Geometry})
+        t.insert([{'geom': Point(0, 0)}])
+        t.add_spatial_index('geom', idx_name='my_idx')
+
+        # duplicate should raise
+        with pytest.raises(pxt.Error, match='Duplicate index name'):
+            t.add_spatial_index('geom', idx_name='my_idx')
+
+        # ignore should not raise
+        t.add_spatial_index('geom', idx_name='my_idx', if_exists='ignore')
+
+    def test_spatial_index_non_geometry_raises(self, uses_db: None) -> None:
+        self._skip_without_postgis()
+        t = pxt.create_table('test_si_bad_col', {'val': pxt.Int})
+        t.insert([{'val': 1}])
+        with pytest.raises(pxt.Error, match='Geometry column'):
+            t.add_spatial_index('val')

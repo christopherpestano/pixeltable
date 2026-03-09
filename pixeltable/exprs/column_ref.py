@@ -274,6 +274,80 @@ class ColumnRef(Expr):
 
         return SimilarityExpr(self, expr, idx_name=idx)
 
+    def st_intersects(self, other: Any, *, idx: str | None = None) -> Expr:
+        """Return a spatial predicate that tests whether this geometry intersects ``other``.
+
+        Uses a spatial index for SQL pushdown when available, otherwise falls back to Python/Shapely.
+
+        Args:
+            other: A GeoJSON dict or Shapely geometry to test against.
+            idx: Optional name of the spatial index to use.
+        """
+        from .spatial_predicate import SpatialOp, SpatialPredicate
+
+        return SpatialPredicate(self, self._geometry_literal(other), op=SpatialOp.INTERSECTS)
+
+    def st_contains(self, other: Any, *, idx: str | None = None) -> Expr:
+        """Return a spatial predicate that tests whether this geometry contains ``other``.
+
+        Uses a spatial index for SQL pushdown when available, otherwise falls back to Python/Shapely.
+
+        Args:
+            other: A GeoJSON dict or Shapely geometry to test against.
+            idx: Optional name of the spatial index to use.
+        """
+        from .spatial_predicate import SpatialOp, SpatialPredicate
+
+        return SpatialPredicate(self, self._geometry_literal(other), op=SpatialOp.CONTAINS)
+
+    def st_within(self, other: Any, *, idx: str | None = None) -> Expr:
+        """Return a spatial predicate that tests whether this geometry is within ``other``.
+
+        Uses a spatial index for SQL pushdown when available, otherwise falls back to Python/Shapely.
+
+        Args:
+            other: A GeoJSON dict or Shapely geometry to test against.
+            idx: Optional name of the spatial index to use.
+        """
+        from .spatial_predicate import SpatialOp, SpatialPredicate
+
+        return SpatialPredicate(self, self._geometry_literal(other), op=SpatialOp.WITHIN)
+
+    def st_dwithin(self, other: Any, distance: float, *, idx: str | None = None) -> Expr:
+        """Return a spatial predicate that tests whether this geometry is within ``distance`` of ``other``.
+
+        Uses a spatial index for SQL pushdown when available, otherwise falls back to Python/Shapely.
+
+        Args:
+            other: A GeoJSON dict or Shapely geometry to test against.
+            distance: Maximum distance threshold.
+            idx: Optional name of the spatial index to use.
+        """
+        from .spatial_predicate import SpatialOp, SpatialPredicate
+
+        return SpatialPredicate(self, self._geometry_literal(other), op=SpatialOp.DWITHIN, distance=distance)
+
+    @staticmethod
+    def _geometry_literal(val: Any) -> Literal:
+        """Normalize a geometry value (Shapely object or GeoJSON dict) to a Literal with GeometryType."""
+        if isinstance(val, Expr):
+            if not isinstance(val, Literal):
+                raise excs.Error('Spatial predicates require a literal geometry value, not an expression')
+            return val
+        # Normalize Shapely objects to GeoJSON dicts
+        try:
+            from shapely.geometry.base import BaseGeometry
+
+            if isinstance(val, BaseGeometry):
+                from shapely.geometry import mapping
+
+                val = mapping(val)
+        except ImportError:
+            pass
+        if not isinstance(val, dict):
+            raise excs.Error(f'Expected a GeoJSON dict or Shapely geometry, got {type(val).__name__}')
+        return Literal(val, col_type=ts.GeometryType())
+
     def embedding(self, *, idx: str | None = None) -> ColumnRef:
         from pixeltable.index import EmbeddingIndex
 
