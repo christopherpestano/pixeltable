@@ -72,6 +72,7 @@ dependencies = [
     "pypdfium2>=4.30.0",
     "shapely>=2.0",
     "geopandas>=0.14",
+    "folium>=0.15",
 ]
 
 [project.urls]

@@ -75,6 +75,7 @@ from .type_system import (
     Timestamp,
     Video,
 )
+from .utils.map import show_map
 
 # This import must go last to avoid circular imports.
 from . import functions, io, iterators  # isort: skip

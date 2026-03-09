@@ -35,6 +35,7 @@ class Formatter:
     __STRING_SEP = ' ...... '
     __STRING_MAX_LEN = 1000
     __NESTED_STRING_MAX_LEN = 300
+    __GEOMETRY_MAP_THRESHOLD = 20
 
     def __init__(self, num_rows: int, num_cols: int, http_address: str):
         self.__num_rows = num_rows
@@ -50,6 +51,8 @@ class Formatter:
             return self.format_binary
         if col_type.is_float_type():
             return self.format_float
+        if col_type.is_geometry_type():
+            return self.format_geometry
         if col_type.is_json_type():
             return self.format_json
         if col_type.is_array_type():
@@ -268,6 +271,36 @@ class Formatter:
         # if mime is None, the attribute string would not be valid html.
         mime_attr = f'type="{mime}"' if mime is not None else ''
         return f'<source src="{src_url}" {mime_attr} />'
+
+    __GEOMETRY_MAP_WIDTH = 240
+    __GEOMETRY_MAP_HEIGHT = 180
+
+    def format_geometry(self, val: Any) -> str:
+        if val is None:
+            return ''
+        if self.__num_rows > self.__GEOMETRY_MAP_THRESHOLD:
+            return self.format_json(val)
+        try:
+            import folium
+            from shapely.geometry import mapping, shape
+
+            w = self.__GEOMETRY_MAP_WIDTH
+            h = self.__GEOMETRY_MAP_HEIGHT
+            geom = shape(val)
+            bounds = geom.bounds
+            center = [(bounds[1] + bounds[3]) / 2, (bounds[0] + bounds[2]) / 2]
+            m = folium.Map(location=center, zoom_start=12, width='100%', height='100%')
+            folium.GeoJson(mapping(geom)).add_to(m)
+            m.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
+            map_html = m.get_root().render()
+            escaped = html.escape(map_html)
+            return (
+                f'<div class="pxt_geometry">'
+                f'<iframe srcdoc="{escaped}" style="width:{w}px;height:{h}px;border:none;"></iframe>'
+                f'</div>'
+            )
+        except Exception:
+            return self.format_json(val)
 
     @classmethod
     def summarize_json(

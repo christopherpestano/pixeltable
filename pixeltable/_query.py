@@ -25,6 +25,7 @@ from pixeltable.utils.description_helper import DescriptionHelper
 from pixeltable.utils.formatter import Formatter
 
 if TYPE_CHECKING:
+    import folium
     import geopandas
     import torch.utils.data
 
@@ -93,6 +94,51 @@ class ResultSet:
             geometry_col = geom_cols[0]
         df[geometry_col] = df[geometry_col].apply(lambda x: _shape(x) if x is not None else None)  # type: ignore[arg-type,return-value]
         return geopandas.GeoDataFrame(df, geometry=geometry_col)
+
+    def show_map(self, geometry_col: str | None = None, *, tooltip_cols: list[str] | None = None) -> 'folium.Map':
+        """Render all geometries in this result set on a single interactive map.
+
+        Args:
+            geometry_col: Name of the geometry column. If ``None``, the first
+                geometry column found in the schema is used.
+            tooltip_cols: Column names to show in hover tooltips. If ``None``,
+                all non-geometry columns are used.
+        """
+        import folium
+        from shapely.geometry import shape as _shape
+
+        geom_cols = [name for name, ct in self.__schema.items() if ct.is_geometry_type()]
+        if geometry_col is None:
+            if not geom_cols:
+                raise excs.Error('No geometry columns found in result set')
+            geometry_col = geom_cols[0]
+
+        if tooltip_cols is None:
+            tooltip_cols = [name for name in self._col_names if name != geometry_col]
+
+        features: list[dict] = []
+        for i in range(len(self)):
+            row = self[i]
+            geojson = row[geometry_col]
+            if geojson is None:
+                continue
+            props = {name: row[name] for name in tooltip_cols if name in row}
+            features.append({'type': 'Feature', 'geometry': geojson, 'properties': props})
+
+        fc = {'type': 'FeatureCollection', 'features': features}
+        m = folium.Map()
+        tooltip = folium.GeoJsonTooltip(fields=list(props.keys())) if tooltip_cols and features else None
+        folium.GeoJson(fc, tooltip=tooltip).add_to(m)
+
+        if features:
+            all_bounds = [_shape(f['geometry']).bounds for f in features]
+            minx = min(b[0] for b in all_bounds)
+            miny = min(b[1] for b in all_bounds)
+            maxx = max(b[2] for b in all_bounds)
+            maxy = max(b[3] for b in all_bounds)
+            m.fit_bounds([[miny, minx], [maxy, maxx]])
+
+        return m
 
     BaseModelT = TypeVar('BaseModelT', bound=pydantic.BaseModel)
 

@@ -1,8 +1,10 @@
+import folium
 import pytest
 from shapely.geometry import MultiPolygon, Point, Polygon, shape
 
 import pixeltable as pxt
 import pixeltable.type_system as ts
+from pixeltable.utils.formatter import Formatter
 
 
 class TestGeometryType:
@@ -232,3 +234,65 @@ class TestGeometryImportExport:
         assert result_gdf.geometry.name == 'geometry'
         for geom in result_gdf.geometry:
             assert geom.geom_type == 'Point'
+
+
+class TestGeometryVisualization:
+    def test_format_geometry_renders_map(self) -> None:
+        fmt = Formatter(num_rows=1, num_cols=1, http_address='http://localhost')
+        geojson = {'type': 'Point', 'coordinates': [1.0, 2.0]}
+        result = fmt.format_geometry(geojson)
+        assert 'pxt_geometry' in result
+        assert '<iframe' in result
+
+    def test_format_geometry_falls_back_for_large_results(self) -> None:
+        fmt = Formatter(num_rows=25, num_cols=1, http_address='http://localhost')
+        geojson = {'type': 'Point', 'coordinates': [1.0, 2.0]}
+        html = fmt.format_geometry(geojson)
+        assert 'pxt_geometry' not in html
+
+    def test_format_geometry_handles_none(self) -> None:
+        fmt = Formatter(num_rows=1, num_cols=1, http_address='http://localhost')
+        assert fmt.format_geometry(None) == ''
+
+    def test_show_map(self, uses_db: None) -> None:
+        t = pxt.create_table('test_show_map', {'geom': pxt.Geometry, 'name': pxt.String})
+        t.insert(
+            [
+                {'geom': Point(0, 0), 'name': 'origin'},
+                {'geom': Point(1, 1), 'name': 'one'},
+                {'geom': Polygon([(2, 2), (3, 2), (3, 3), (2, 3), (2, 2)]), 'name': 'square'},
+            ]
+        )
+        m = pxt.show_map(t, 'geom', tooltip_cols=['name'])
+        assert isinstance(m, folium.Map)
+
+    def test_show_map_with_limit(self, uses_db: None) -> None:
+        t = pxt.create_table('test_show_map_limit', {'geom': pxt.Geometry})
+        t.insert([{'geom': Point(i, i)} for i in range(10)])
+        m = pxt.show_map(t, 'geom', limit=3)
+        assert isinstance(m, folium.Map)
+
+    def test_show_map_rejects_non_geometry(self, uses_db: None) -> None:
+        t = pxt.create_table('test_show_map_err', {'val': pxt.Int})
+        t.insert([{'val': 1}])
+        with pytest.raises(ValueError, match='not a Geometry column'):
+            pxt.show_map(t, 'val')
+
+    def test_result_set_show_map(self, uses_db: None) -> None:
+        t = pxt.create_table('test_rs_map', {'geom': pxt.Geometry, 'name': pxt.String})
+        t.insert(
+            [
+                {'geom': Point(0, 0), 'name': 'origin'},
+                {'geom': Point(1, 1), 'name': 'one'},
+                {'geom': Point(2, 2), 'name': 'two'},
+            ]
+        )
+        # select a subset and show on one map
+        m = t.where(t.name.isin(['origin', 'one'])).collect().show_map()
+        assert isinstance(m, folium.Map)
+
+    def test_result_set_show_map_auto_tooltips(self, uses_db: None) -> None:
+        t = pxt.create_table('test_rs_map_tt', {'geom': pxt.Geometry, 'label': pxt.String, 'val': pxt.Int})
+        t.insert([{'geom': Point(0, 0), 'label': 'a', 'val': 1}])
+        m = t.collect().show_map()
+        assert isinstance(m, folium.Map)
