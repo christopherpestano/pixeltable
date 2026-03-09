@@ -244,7 +244,9 @@ def clean_db(drop_md_tables: bool = False) -> None:
     engine = Env.get().engine
     inspector = sql.inspect(engine)
     all_table_names = set(inspector.get_table_names())
-    data_table_names = all_table_names - _MD_TABLE_NAMES
+    # Exclude PostGIS extension tables that cannot be dropped directly
+    postgis_tables = {'spatial_ref_sys'}
+    data_table_names = all_table_names - _MD_TABLE_NAMES - postgis_tables
     existing_md_names = all_table_names & _MD_TABLE_NAMES
 
     with engine.connect() as conn:

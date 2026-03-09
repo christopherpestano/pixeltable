@@ -420,12 +420,12 @@ class TestSpatialIndex:
         t.insert([{'geom': Point(1, 2)}, {'geom': Point(3, 4)}])
         t.add_spatial_index('geom')
 
-        indexes = t.list_indexes()
+        indexes = t._list_index_info_for_test()
         assert len(indexes) == 1
         assert indexes[0]['_column'] == 'geom'
 
         t.drop_spatial_index(column='geom')
-        assert len(t.list_indexes()) == 0
+        assert len(t._list_index_info_for_test()) == 0
 
     def test_spatial_index_accelerated_intersects(self, uses_db: None) -> None:
         self._skip_without_postgis()
