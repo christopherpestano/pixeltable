@@ -275,6 +275,13 @@ class Formatter:
     __GEOMETRY_MAP_WIDTH = 240
     __GEOMETRY_MAP_HEIGHT = 180
 
+    # PouchDB + cached tile layer plugin injected into each folium iframe.
+    # srcdoc iframes share the parent's origin, so all maps share one IndexedDB tile cache.
+    __TILE_CACHE_SCRIPTS = (
+        '<script src="https://unpkg.com/pouchdb@9.0.0/dist/pouchdb.min.js"></script>'
+        '<script src="https://unpkg.com/leaflet-tilelayer-pouchdb@1.0.0/L.TileLayer.PouchDBCached.js"></script>'
+    )
+
     def format_geometry(self, val: Any) -> str:
         if val is None:
             return ''
@@ -289,10 +296,21 @@ class Formatter:
             geom = shape(val)
             bounds = geom.bounds
             center = [(bounds[1] + bounds[3]) / 2, (bounds[0] + bounds[2]) / 2]
-            m = folium.Map(location=center, zoom_start=12, width='100%', height='100%')
+            m = folium.Map(location=center, zoom_start=12, width='100%', height='100%', tiles=None)
             folium.GeoJson(mapping(geom)).add_to(m)
             m.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
             map_html = m.get_root().render()
+            # Inject PouchDB cache scripts and a cached tile layer
+            map_html = map_html.replace('</head>', f'{self.__TILE_CACHE_SCRIPTS}</head>')
+            # Add cached tile layer after the map is created
+            map_html = map_html.replace(
+                '</script>\n</html>',
+                'L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",'
+                '{"maxZoom":19,"useCache":true,"crossOrigin":true,'
+                '"attribution":"\\u0026copy; OpenStreetMap contributors"})'
+                '.addTo(Object.values(window).find(function(v){return v instanceof L.Map}));\n'
+                '</script>\n</html>',
+            )
             escaped = html.escape(map_html)
             return (
                 f'<div class="pxt_geometry">'
