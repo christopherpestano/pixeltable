@@ -16,6 +16,12 @@ variable "spot_max_price" {
   default     = "0.50"
 }
 
+variable "availability_zone" {
+  description = "Availability zone for the instance (leave empty to use default)"
+  type        = string
+  default     = "us-east-1b"
+}
+
 variable "idle_timeout_minutes" {
   description = "Minutes of low CPU before the instance is automatically stopped"
   type        = number

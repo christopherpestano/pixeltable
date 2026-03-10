@@ -102,10 +102,23 @@ fi
 # ── Configure Pixeltable ───────────────────────────────────────────────────
 mkdir -p "$(dirname "$PXT_CONFIG")"
 
+info "Detecting GPUs on remote node..."
+NUM_GPUS=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i "$KEY_FILE" "ec2-user@$PUBLIC_IP" 'nvidia-smi -L 2>/dev/null | wc -l' || echo 0)
+NUM_GPUS=$((NUM_GPUS + 0))  # ensure it's a number
+NUM_CPUS=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i "$KEY_FILE" "ec2-user@$PUBLIC_IP" 'nproc' || echo 1)
+NUM_CPUS=$((NUM_CPUS + 0))
+if [[ "$NUM_GPUS" -gt 0 ]]; then
+  info "Detected $NUM_GPUS GPU(s) and $NUM_CPUS CPUs on remote node"
+else
+  info "No GPUs detected; $NUM_CPUS CPUs on remote node"
+fi
+
 RAY_SECTION=$(cat <<EOF
 
 [ray]
 address = "ray://localhost:10001"
+num_cpus = $NUM_CPUS
+num_gpus = $NUM_GPUS
 runtime_env = '{"py_modules": ["$PXT_ROOT"], "excludes": [".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", "infra", "docs", "notebooks", "**/*.mp4", "**/*.avi"]}'
 EOF
 )

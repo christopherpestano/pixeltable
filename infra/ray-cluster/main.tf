@@ -94,6 +94,7 @@ resource "aws_spot_instance_request" "ray_head" {
   spot_price             = var.spot_max_price
   spot_type              = "one-time"
   wait_for_fulfillment   = true
+  availability_zone      = var.availability_zone
 
   # 150 GB root volume (DLAMI snapshot is ~105GB; extra space for model weights)
   root_block_device {
