@@ -84,28 +84,32 @@ resource "aws_security_group" "ray_ssh" {
   }
 }
 
-# --- Spot instance ---
+# --- Instance ---
 
-resource "aws_spot_instance_request" "ray_head" {
-  ami                    = data.aws_ami.dlami.id
+resource "aws_instance" "ray_head" {
+  ami                    = var.ami_id != "" ? var.ami_id : data.aws_ami.dlami.id
   instance_type          = var.instance_type
   key_name               = aws_key_pair.ray.key_name
   vpc_security_group_ids = [aws_security_group.ray_ssh.id]
-  spot_price             = var.spot_max_price
-  spot_type              = "one-time"
-  wait_for_fulfillment   = true
   availability_zone      = var.availability_zone
 
-  # 150 GB root volume (DLAMI snapshot is ~105GB; extra space for model weights)
+  dynamic "instance_market_options" {
+    for_each = var.use_spot ? [1] : []
+    content {
+      market_type = "spot"
+      spot_options {
+        max_price          = var.spot_max_price
+        spot_instance_type = "one-time"
+      }
+    }
+  }
+
   root_block_device {
-    volume_size = 150
+    volume_size = 200
     volume_type = "gp3"
   }
 
   user_data = file("${path.module}/user-data.sh")
-
-  # Ensure the CloudWatch ec2:stop action works on this instance
-  instance_initiated_shutdown_behavior = "terminate"
 
   tags = {
     Name = "ray-cluster-head"

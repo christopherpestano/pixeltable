@@ -244,8 +244,12 @@ class FnCallEvaluator(Evaluator):
         if self.call_args_queue is None or self.call_args_queue.empty():
             return
         batched_call_args = self._create_batch_call_args(list(self._queued_call_args_iter()))
-        task = asyncio.create_task(self.eval_batch(batched_call_args))
-        self.dispatcher.register_task(task)
+        if self.fn_call.resource_pool is not None:
+            scheduler = self.dispatcher.schedulers[self.fn_call.resource_pool]
+            scheduler.submit(batched_call_args, self.eval_ctx)
+        else:
+            task = asyncio.create_task(self.eval_batch(batched_call_args))
+            self.dispatcher.register_task(task)
 
 
 class NestedRowList:

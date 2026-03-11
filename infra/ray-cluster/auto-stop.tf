@@ -11,10 +11,10 @@ resource "aws_cloudwatch_metric_alarm" "idle_stop" {
   alarm_description   = "Stop Ray GPU instance after ${var.idle_timeout_minutes} min of idle CPU"
 
   dimensions = {
-    InstanceId = aws_spot_instance_request.ray_head.spot_instance_id
+    InstanceId = aws_instance.ray_head.id
   }
 
   alarm_actions = [
-    "arn:aws:automate:${var.region}:ec2:terminate",
+    "arn:aws:automate:${var.region}:ec2:stop",
   ]
 }

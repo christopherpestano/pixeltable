@@ -504,14 +504,11 @@ class RayScheduler(Scheduler):
                     request.row[request.fn_call.slot_idx] = val
             # Ray remote execution
             elif request.is_batched:
-                if pxt_fn.is_async:
-                    remote_fn = self._get_remote_fn(pxt_fn.aexec_batch)
-                else:
-                    remote_fn = self._get_remote_fn(pxt_fn.exec_batch)
-                if pxt_fn.is_async:
-                    obj_ref = remote_fn.remote(*request.batch_args, **request.batch_kwargs)
-                else:
-                    obj_ref = remote_fn.remote(request.batch_args, request.batch_kwargs)
+                # ray.remote() can only wrap plain functions, not bound methods like pxt_fn.exec_batch.
+                # We wrap py_fn and do the constant/batched kwarg unpacking here before submitting.
+                remote_fn = self._get_remote_fn(pxt_fn.py_fn)
+                constant_kwargs, batched_kwargs = pxt_fn.create_batch_kwargs(request.batch_kwargs)
+                obj_ref = remote_fn.remote(*request.batch_args, **constant_kwargs, **batched_kwargs)
                 result = await asyncio.wrap_future(obj_ref.future())
                 assert len(result) == len(request.rows)
                 for row, val in zip(request.rows, result):

@@ -5,17 +5,17 @@ output "region" {
 
 output "instance_id" {
   description = "EC2 instance ID"
-  value       = aws_spot_instance_request.ray_head.spot_instance_id
+  value       = aws_instance.ray_head.id
 }
 
 output "public_ip" {
   description = "Public IP of the Ray head node"
-  value       = aws_spot_instance_request.ray_head.public_ip
+  value       = aws_instance.ray_head.public_ip
 }
 
 output "ssh_tunnel_command" {
   description = "Run this to connect your local machine to the remote Ray cluster"
-  value       = "ssh -L 10001:localhost:10001 -L 8265:localhost:8265 ec2-user@${aws_spot_instance_request.ray_head.public_ip} -i ~/.ssh/pixeltable-ray.pem"
+  value       = "ssh -L 10001:localhost:10001 -L 8265:localhost:8265 ec2-user@${aws_instance.ray_head.public_ip} -i ~/.ssh/pixeltable-ray.pem"
 }
 
 output "pixeltable_config" {

@@ -1117,8 +1117,7 @@ def text_to_image(
         model_id,
         lambda x: AutoPipelineForText2Image.from_pretrained(
             x,
-            dtype=torch.float16 if device == 'cuda' else torch.float32,
-            device_map='auto' if device == 'cuda' else None,
+            torch_dtype=torch.float16 if device == 'cuda' else torch.float32,
             safety_checker=None,  # Disable safety checker for performance
             requires_safety_checker=False,
         ),
@@ -1128,8 +1127,8 @@ def text_to_image(
     try:
         if device == 'cuda' and hasattr(pipeline, 'enable_model_cpu_offload'):
             pipeline.enable_model_cpu_offload()
-        if hasattr(pipeline, 'enable_memory_efficient_attention'):
-            pipeline.enable_memory_efficient_attention()
+        elif device != 'cpu':
+            pipeline.to(device)
     except Exception:
         pass  # Ignore optimization failures
 
@@ -1138,6 +1137,94 @@ def text_to_image(
     with torch.no_grad():
         result = pipeline(prompt, height=height, width=width, generator=generator, **model_kwargs)
         return result.images[0]
+
+
+@pxt.udf(batch_size=8)
+def text_to_image_batch(
+    prompt: Batch[str],
+    *,
+    model_id: str,
+    height: int = 512,
+    width: int = 512,
+    seed: int | None = None,
+    model_kwargs: dict[str, Any] | None = None,
+) -> Batch[PIL.Image.Image]:
+    """
+    Batched version of ``text_to_image``. Loads the model once and generates images for all prompts
+    in the batch, avoiding repeated model loading overhead.
+
+    __Requirements:__
+
+    - `pip install torch transformers diffusers accelerate`
+
+    Args:
+        prompt: The text prompts describing the desired images.
+        model_id: The pretrained text-to-image model to use.
+        height: Height of the generated images in pixels.
+        width: Width of the generated images in pixels.
+        seed: Optional random seed for reproducibility.
+        model_kwargs: Additional keyword arguments to pass to the model, such as `num_inference_steps`,
+            `guidance_scale`, or `negative_prompt`.
+
+    Returns:
+        The generated Images.
+
+    Examples:
+        Add a computed column that generates images from text prompts:
+
+        >>> tbl.add_computed_column(
+        ...     generated_image=text_to_image_batch(
+        ...         tbl.prompt,
+        ...         model_id='stable-diffusion-v1.5/stable-diffusion-v1-5',
+        ...         height=512,
+        ...         width=512,
+        ...         model_kwargs={'num_inference_steps': 25},
+        ...     )
+        ... )
+    """
+    env.Env.get().require_package('transformers')
+    env.Env.get().require_package('diffusers')
+    env.Env.get().require_package('accelerate')
+    device = resolve_torch_device('auto', allow_mps=False)
+    import torch
+    from diffusers import AutoPipelineForText2Image
+
+    if model_kwargs is None:
+        model_kwargs = {}
+
+    if height <= 0 or width <= 0:
+        raise excs.Error(f'Height ({height}) and width ({width}) must be positive integers')
+
+    if height % 8 != 0 or width % 8 != 0:
+        raise excs.Error(f'Height ({height}) and width ({width}) must be divisible by 8 for most diffusion models')
+
+    pipeline = _lookup_model(
+        model_id,
+        lambda x: AutoPipelineForText2Image.from_pretrained(
+            x,
+            torch_dtype=torch.float16 if device == 'cuda' else torch.float32,
+            safety_checker=None,
+            requires_safety_checker=False,
+        ),
+        device=device,
+    )
+
+    try:
+        if device == 'cuda' and hasattr(pipeline, 'enable_model_cpu_offload'):
+            pipeline.enable_model_cpu_offload()
+        elif device != 'cpu':
+            pipeline.to(device)
+    except Exception:
+        pass
+
+    generator = None if seed is None else torch.Generator(device=device).manual_seed(seed)
+
+    images = []
+    with torch.no_grad():
+        for p in prompt:
+            result = pipeline(p, height=height, width=width, generator=generator, **model_kwargs)
+            images.append(result.images[0])
+    return images
 
 
 @pxt.udf
@@ -1315,8 +1402,7 @@ def image_to_image(
         model_id,
         lambda x: AutoPipelineForImage2Image.from_pretrained(
             x,
-            dtype=torch.float16 if device == 'cuda' else torch.float32,
-            device_map='auto' if device == 'cuda' else None,
+            torch_dtype=torch.float16 if device == 'cuda' else torch.float32,
             safety_checker=None,  # Disable safety checker for performance
             requires_safety_checker=False,
         ),
@@ -1326,8 +1412,8 @@ def image_to_image(
     try:
         if device == 'cuda' and hasattr(pipeline, 'enable_model_cpu_offload'):
             pipeline.enable_model_cpu_offload()
-        if hasattr(pipeline, 'enable_memory_efficient_attention'):
-            pipeline.enable_memory_efficient_attention()
+        elif device != 'cpu':
+            pipeline.to(device)
     except Exception:
         pass  # Ignore optimization failures
 
@@ -1623,7 +1709,7 @@ def _lookup_model(
 ) -> T:
     from torch import nn
 
-    key = (model_id, create, device)  # For safety, include the `create` callable in the cache key
+    key = (model_id, device)
     if key not in _model_cache:
         if pass_device_to_create:
             model = create(model_id, device=device)
@@ -1638,15 +1724,15 @@ def _lookup_model(
 
 
 def _lookup_processor(model_id: str, create: Callable[[str], T]) -> T:
-    key = (model_id, create)  # For safety, include the `create` callable in the cache key
+    key = model_id
     if key not in _processor_cache:
         _processor_cache[key] = create(model_id)
     return _processor_cache[key]
 
 
-_model_cache: dict[tuple[str, Callable, str | None], Any] = {}
+_model_cache: dict[tuple[str, str | None], Any] = {}
 _speecht5_embeddings_dataset: list[Any] = []  # contains only the speecht5 embeddings loaded by text_to_speech()
-_processor_cache: dict[tuple[str, Callable], Any] = {}
+_processor_cache: dict[str, Any] = {}
 
 
 __all__ = local_public_names(__name__)
