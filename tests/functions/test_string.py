@@ -505,6 +505,16 @@ class TestString:
         res_n1 = t.select(out=replace_re(s, '[aeiou]', '*', n=1)).collect()['out']
         assert res_n1 == [re.sub(r'[aeiou]', '*', x, count=1) for x in strs]
 
+        # \g<N> backreference in replacement must fall back to Python
+        # (PG would insert the literal text '\g<1>' instead of the captured group)
+        chk(
+            replace_re,
+            '(cat)',
+            r'\g<1>dog',
+            expected=[re.sub(r'(cat)', r'\g<1>dog', x) for x in strs],
+            label='replace_re backref',
+        )
+
         # ── Patterns that must fall back to Python ────────────────────────────
         # All of these use constructs that PG handles differently. The whitelist
         # rejects them, so both SQL and Python paths run through Python and

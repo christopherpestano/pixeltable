@@ -98,7 +98,7 @@ def _can_pushdown_regex(pattern: sql.ColumnElement) -> bool:
     except re.error:
         return False
     if parsed.state.groupdict:
-        return False  # (?P<name>...) -- Python-only named groups
+        return False  # (?P<name>...) -- syntax differs from PG's (?<name>...)
     if parsed.state.flags & ~re.UNICODE:
         return False  # inline flags like (?i) -- PG interprets them differently
     return _ast_is_pg_safe(parsed)
@@ -754,6 +754,11 @@ def _(
     if n is not None or flags is not None:
         return None  # Can't bound replacements or handle re flags in SQL
     if not _can_pushdown_regex(pattern):
+        return None
+    # Python's \g<N> and \g<name> backreference syntax has no PG equivalent;
+    # PG would insert the literal text instead of the captured group.
+    repl_val = _literal_value(repl)
+    if repl_val is not None and '\\g' in repl_val:
         return None
     return sql.func.regexp_replace(self, pattern, repl, 'g')
 
