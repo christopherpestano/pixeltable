@@ -1,5 +1,6 @@
 """Integration tests for the v48 → v49 primary key migration converter."""
 
+import copy
 import logging
 
 import pytest
@@ -29,78 +30,70 @@ def _downgrade_to_v48(engine: sql.engine.Engine) -> None:
 
 
 def _get_table_md(engine: sql.engine.Engine, table_name: str) -> tuple | None:
-    """Return (tbl_id, table_md) for the given table name, or None if not found."""
+    """Return (tbl_id, table_md) for the given table name, or None."""
     with engine.begin() as conn:
         for row in conn.execute(sql.select(Table.id, Table.md)):
-            tbl_id = row[0]
-            table_md = row[1]
-            if table_md.get('name') == table_name:
-                return tbl_id, table_md
+            if row[1].get('name') == table_name:
+                return row[0], row[1]
     return None
 
 
 def _drop_pk_index(engine: sql.engine.Engine, tbl_id) -> None:
-    """Drop the physical pk_idx from the database."""
-    idx_name = f'pk_idx_{tbl_id.hex}'
     with engine.begin() as conn:
-        conn.execute(sql.text(f'DROP INDEX IF EXISTS {idx_name}'))
+        conn.execute(sql.text(f'DROP INDEX IF EXISTS pk_idx_{tbl_id.hex}'))
 
 
 def _strip_primary_index_md(engine: sql.engine.Engine, tbl_id) -> None:
-    """Remove primary_index_md from the table metadata (simulating pre-migration state)."""
-    import copy
-
+    """Remove primary_index_md from table metadata (simulating pre-migration state)."""
     with engine.begin() as conn:
-        for row in conn.execute(sql.select(Table.id, Table.md).where(Table.id == tbl_id)):
-            md = copy.deepcopy(row[1])
-            md['primary_index_md'] = None
-            conn.execute(sql.update(Table).where(Table.id == tbl_id).values(md=md))
+        row = conn.execute(sql.select(Table.md).where(Table.id == tbl_id)).fetchone()
+        md = copy.deepcopy(row[0])
+        md['primary_index_md'] = None
+        conn.execute(sql.update(Table).where(Table.id == tbl_id).values(md=md))
 
 
 def _index_exists(engine: sql.engine.Engine, tbl_id) -> bool:
-    """Check if the pk_idx exists in pg_indexes."""
-    idx_name = f'pk_idx_{tbl_id.hex}'
-    store_name = f'tbl_{tbl_id.hex}'
     with engine.begin() as conn:
-        row = conn.execute(
-            sql.text('SELECT 1 FROM pg_indexes WHERE tablename = :tbl AND indexname = :idx'),
-            {'tbl': store_name, 'idx': idx_name},
-        ).fetchone()
-        return row is not None
+        return (
+            conn.execute(
+                sql.text('SELECT 1 FROM pg_indexes WHERE tablename = :tbl AND indexname = :idx'),
+                {'tbl': f'tbl_{tbl_id.hex}', 'idx': f'pk_idx_{tbl_id.hex}'},
+            ).fetchone()
+            is not None
+        )
 
 
 def _simulate_pre_migration(engine: sql.engine.Engine, tbl_id) -> None:
-    """Simulate pre-migration state: drop index, remove metadata, downgrade version."""
+    """Drop index, remove metadata, downgrade version."""
     _drop_pk_index(engine, tbl_id)
     _strip_primary_index_md(engine, tbl_id)
     _downgrade_to_v48(engine)
+
+
+def _find_pk_and_string_col(md: dict) -> tuple[int, int]:
+    """Return (pk_col_id, string_col_id) from table metadata."""
+    pk_id = next(c['id'] for c in md['column_md'].values() if c.get('is_pk', False))
+    str_id = next(c['id'] for c in md['column_md'].values() if c.get('col_type', {}).get('_classname') == 'StringType')
+    return pk_id, str_id
 
 
 class TestPkMigration:
     """Tests for the v48 → v49 primary key migration converter."""
 
     def test_happy_path_single_int_pk(self, init_env: None) -> None:
-        """Table with single int PK, no duplicates: index should be created and PrimaryIndexMd persisted."""
+        """Table with single int PK, no duplicates: index created and PrimaryIndexMd persisted."""
         engine = Env.get().engine
 
-        # Create table with PK via normal API
         t = pxt.create_table('test_pk_happy', {'id': pxt.Required[pxt.Int], 'name': pxt.String}, primary_key='id')
         t.insert([{'id': 1, 'name': 'alice'}, {'id': 2, 'name': 'bob'}])
 
         result = _get_table_md(engine, 'test_pk_happy')
         assert result is not None
         tbl_id, _ = result
-
-        # Verify index exists before migration
         assert _index_exists(engine, tbl_id), 'PK index should exist after table creation'
 
-        # Simulate pre-migration state
         _simulate_pre_migration(engine, tbl_id)
-
-        # Verify index is gone
         assert not _index_exists(engine, tbl_id), 'PK index should be gone after simulation'
-
-        # Verify primary_index_md is gone
         _, md = _get_table_md(engine, 'test_pk_happy')
         assert md.get('primary_index_md') is None, 'primary_index_md should be None before migration'
 
@@ -108,21 +101,17 @@ class TestPkMigration:
         Env._init_env()
         reload_catalog()
 
-        # Verify schema version upgraded
         with orm.Session(Env.get().engine) as session:
             info = session.query(SystemInfo).one()
             assert info.md['schema_version'] == VERSION
 
-        # Verify index was recreated
         engine = Env.get().engine
         assert _index_exists(engine, tbl_id), 'PK index should be recreated by migration'
 
-        # Verify PrimaryIndexMd was persisted
         _, md = _get_table_md(engine, 'test_pk_happy')
         assert md.get('primary_index_md') is not None, 'primary_index_md should be set after migration'
         assert len(md['primary_index_md']['indexed_col_ids']) == 1
 
-        # Verify PK enforcement works: inserting a duplicate should fail
         t = pxt.get_table('test_pk_happy')
         with pytest.raises(pxt.exceptions.Error, match='Duplicate primary key'):
             t.insert([{'id': 1, 'name': 'duplicate'}])
@@ -133,7 +122,6 @@ class TestPkMigration:
         """Table with duplicates: PK should be stripped, all rows preserved."""
         engine = Env.get().engine
 
-        # Create table with PK
         t = pxt.create_table('test_pk_dupes', {'id': pxt.Required[pxt.Int], 'name': pxt.String}, primary_key='id')
         t.insert([{'id': 1, 'name': 'alice'}, {'id': 2, 'name': 'bob'}])
 
@@ -141,29 +129,16 @@ class TestPkMigration:
         assert result is not None
         tbl_id, _ = result
 
-        # Simulate pre-migration state
         _simulate_pre_migration(engine, tbl_id)
 
-        # Insert a duplicate row via raw SQL (bypassing the now-dropped index)
+        # Insert duplicate via raw SQL (bypassing the now-dropped index)
         store_name = f'tbl_{tbl_id.hex}'
+        _, md = _get_table_md(engine, 'test_pk_dupes')
+        id_col, name_col = _find_pk_and_string_col(md)
         with engine.begin() as conn:
-            # Find the col_id for 'id' column
-            _, md = _get_table_md(engine, 'test_pk_dupes')
-            id_col_id = None
-            name_col_id = None
-            for col_md in md['column_md'].values():
-                if col_md.get('is_pk', False):
-                    id_col_id = col_md['id']
-                elif col_md.get('col_type', {}).get('_classname') == 'StringType':
-                    name_col_id = col_md['id']
-
-            assert id_col_id is not None
-            assert name_col_id is not None
-
-            # Insert duplicate row with same id=1 via raw SQL
             conn.execute(
                 sql.text(
-                    f'INSERT INTO {store_name} (rowid, v_min, v_max, col_{id_col_id}, col_{name_col_id}) '
+                    f'INSERT INTO {store_name} (rowid, v_min, v_max, col_{id_col}, col_{name_col}) '
                     f'VALUES (999, 0, {_MAX_VERSION}, 1, :name)'
                 ),
                 {'name': 'duplicate_alice'},
@@ -173,17 +148,14 @@ class TestPkMigration:
         Env._init_env()
         reload_catalog()
 
-        # Verify index was NOT created (because of duplicates)
         engine = Env.get().engine
         assert not _index_exists(engine, tbl_id), 'PK index should NOT exist when duplicates present'
 
-        # Verify PK was stripped from metadata
         _, md = _get_table_md(engine, 'test_pk_dupes')
         assert md.get('primary_index_md') is None, 'primary_index_md should be None when dupes found'
         for col_md in md['column_md'].values():
             assert col_md.get('is_pk', False) is False, 'All columns should have is_pk=False'
 
-        # Verify all rows are preserved (original 2 + duplicate = 3 live rows)
         with engine.begin() as conn:
             count = conn.execute(sql.text(f'SELECT COUNT(*) FROM {store_name} WHERE v_max = {_MAX_VERSION}')).scalar()
             assert count == 3, f'Expected 3 live rows, got {count}'
@@ -191,10 +163,9 @@ class TestPkMigration:
         pxt.drop_table('test_pk_dupes', force=True)
 
     def test_composite_pk_with_string(self, init_env: None) -> None:
-        """Composite PK with int + string column: index should use left(col, 256) for strings."""
+        """Composite PK with int + string: index should use left(col, 256) for strings."""
         engine = Env.get().engine
 
-        # Create table with composite PK including a string column
         t = pxt.create_table(
             'test_pk_composite',
             {'region': pxt.Required[pxt.String], 'user_id': pxt.Required[pxt.Int], 'data': pxt.String},
@@ -206,35 +177,28 @@ class TestPkMigration:
         assert result is not None
         tbl_id, _ = result
 
-        # Simulate pre-migration state
         _simulate_pre_migration(engine, tbl_id)
 
         # Trigger migration
         Env._init_env()
         reload_catalog()
 
-        # Verify index was created
         engine = Env.get().engine
         assert _index_exists(engine, tbl_id), 'Composite PK index should be created'
 
-        # Verify PrimaryIndexMd has both columns
         _, md = _get_table_md(engine, 'test_pk_composite')
         pim = md.get('primary_index_md')
         assert pim is not None
         assert len(pim['indexed_col_ids']) == 2
 
-        # Verify the index definition uses left() for the string column
-        idx_name = f'pk_idx_{tbl_id.hex}'
-        store_name = f'tbl_{tbl_id.hex}'
+        # Verify index definition uses left() for the string column
         with engine.begin() as conn:
             row = conn.execute(
                 sql.text('SELECT indexdef FROM pg_indexes WHERE tablename = :tbl AND indexname = :idx'),
-                {'tbl': store_name, 'idx': idx_name},
+                {'tbl': f'tbl_{tbl_id.hex}', 'idx': f'pk_idx_{tbl_id.hex}'},
             ).fetchone()
             assert row is not None
-            indexdef = row[0]
-            # PostgreSQL may quote left as "left" in the index definition
-            assert 'left' in indexdef.lower(), f'String PK column should use left() truncation: {indexdef}'
+            assert 'left' in row[0].lower(), f'String PK column should use left() truncation: {row[0]}'
 
         pxt.drop_table('test_pk_composite', force=True)
 
@@ -242,22 +206,19 @@ class TestPkMigration:
         """Table without PK columns should not be affected by migration."""
         engine = Env.get().engine
 
-        # Create table without PK
         t = pxt.create_table('test_no_pk', {'id': pxt.Int, 'name': pxt.String})
         t.insert([{'id': 1, 'name': 'alice'}])
 
         result = _get_table_md(engine, 'test_no_pk')
         assert result is not None
-        tbl_id, _orig_md = result
+        tbl_id, _ = result
 
-        # Downgrade version
         _downgrade_to_v48(engine)
 
         # Trigger migration
         Env._init_env()
         reload_catalog()
 
-        # Verify table is unmodified
         engine = Env.get().engine
         _, md = _get_table_md(engine, 'test_no_pk')
         assert md.get('primary_index_md') is None
@@ -276,20 +237,17 @@ class TestPkMigration:
         assert result is not None
         tbl_id, _ = result
 
-        # Simulate pre-migration state
         _simulate_pre_migration(engine, tbl_id)
 
         # Run migration twice
         Env._init_env()
         reload_catalog()
 
-        # Downgrade again and run migration again
         engine = Env.get().engine
         _downgrade_to_v48(engine)
         Env._init_env()
         reload_catalog()
 
-        # Verify everything is consistent
         engine = Env.get().engine
         assert _index_exists(engine, tbl_id)
         _, md = _get_table_md(engine, 'test_pk_idempotent')
@@ -301,7 +259,6 @@ class TestPkMigration:
         """Migration handles multiple tables: one with dupes (fails), one without (succeeds)."""
         engine = Env.get().engine
 
-        # Create two tables with PK
         t1 = pxt.create_table('test_pk_multi_good', {'id': pxt.Required[pxt.Int], 'val': pxt.String}, primary_key='id')
         t1.insert([{'id': 1, 'val': 'a'}, {'id': 2, 'val': 'b'}])
 
@@ -316,26 +273,17 @@ class TestPkMigration:
 
         # Simulate pre-migration for both tables
         _simulate_pre_migration(engine, tbl_id1)
-        # Re-downgrade is needed since first call sets it to 48, but second table also needs setup
         _drop_pk_index(engine, tbl_id2)
         _strip_primary_index_md(engine, tbl_id2)
         _downgrade_to_v48(engine)
 
         # Insert duplicate into the second table
         store_name2 = f'tbl_{tbl_id2.hex}'
-        id_col_id = None
-        val_col_id = None
-        for col_md in md2['column_md'].values():
-            if col_md.get('is_pk', False):
-                id_col_id = col_md['id']
-            elif col_md.get('col_type', {}).get('_classname') == 'StringType':
-                val_col_id = col_md['id']
-        assert id_col_id is not None and val_col_id is not None
-
+        id_col, val_col = _find_pk_and_string_col(md2)
         with engine.begin() as conn:
             conn.execute(
                 sql.text(
-                    f'INSERT INTO {store_name2} (rowid, v_min, v_max, col_{id_col_id}, col_{val_col_id}) '
+                    f'INSERT INTO {store_name2} (rowid, v_min, v_max, col_{id_col}, col_{val_col}) '
                     f'VALUES (999, 0, {_MAX_VERSION}, 10, :val)'
                 ),
                 {'val': 'duplicate'},
@@ -345,13 +293,11 @@ class TestPkMigration:
         Env._init_env()
         reload_catalog()
 
-        # Verify: good table has index and PrimaryIndexMd
         engine = Env.get().engine
         assert _index_exists(engine, tbl_id1), 'Good table should have PK index'
         _, md1 = _get_table_md(engine, 'test_pk_multi_good')
         assert md1.get('primary_index_md') is not None
 
-        # Verify: bad table has NO index and PK stripped
         assert not _index_exists(engine, tbl_id2), 'Bad table should NOT have PK index'
         _, md2_after = _get_table_md(engine, 'test_pk_multi_bad')
         assert md2_after.get('primary_index_md') is None
