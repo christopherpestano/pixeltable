@@ -220,7 +220,6 @@ class RateLimitsScheduler(Scheduler):
                         if is_retriable:
                             retry_delay = retry_delay or exponential_backoff(num_retries)
                     if retry_delay is not None:
-                        self.total_retried += 1
                         _logger.debug(
                             f'scheduler {self.resource_pool}: sleeping {retry_delay:.2f}s before retrying'
                             f' attempt {num_retries} based on the information in the error'
