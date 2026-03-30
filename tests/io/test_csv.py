@@ -1,9 +1,11 @@
 import csv
+import os
 import pathlib
 
 import pixeltable as pxt
+from pixeltable.io.utils import normalize_media_url
 
-from ..utils import create_test_tbl, validate_update_status
+from ..utils import create_all_datatypes_tbl, create_test_tbl, get_audio_files, get_image_files, validate_update_status
 
 
 class TestCsv:
@@ -73,3 +75,71 @@ class TestCsv:
         assert len(exported) == 2
         assert int(exported[0]['c_int']) == 1
         assert exported[1]['c_string'] == 'world'
+
+    def test_export_media_urls(self, uses_db: None, tmp_path: pathlib.Path) -> None:
+        """Media columns export original local paths, never ~/.pixeltable cache paths."""
+        t = create_all_datatypes_tbl()
+
+        csv_path = tmp_path / 'media.csv'
+        pxt.io.export_csv(t, csv_path)
+
+        with open(csv_path, encoding='utf-8') as f:
+            exported = list(csv.DictReader(f))
+
+        assert len(exported) > 0
+
+        media_cols = ['c_image', 'c_video', 'c_audio', 'c_document']
+        for row in exported:
+            for col in media_cols:
+                val = row[col]
+                assert '.pixeltable' not in val, f'Exported {col} contains .pixeltable cache path: {val}'
+
+        original_image = get_image_files()[0]
+        assert exported[0]['c_image'] == original_image
+
+        audio_files = get_audio_files()
+        assert exported[0]['c_audio'] in audio_files
+
+        for col in media_cols:
+            val = exported[0][col]
+            assert os.path.exists(val), f'Exported {col} path does not exist: {val}'
+
+        csv_path2 = tmp_path / 'media_select.csv'
+        pxt.io.export_csv(t.select(t.c_image, t.c_string), csv_path2)
+
+        with open(csv_path2, encoding='utf-8') as f:
+            exported2 = list(csv.DictReader(f))
+
+        assert list(exported2[0].keys()) == ['c_image', 'c_string']
+        for row in exported2:
+            assert '.pixeltable' not in row['c_image'], (
+                f'Selected c_image contains .pixeltable cache path: {row["c_image"]}'
+            )
+            assert row['c_image'] == original_image
+
+    def test_export_media_urls_with_nulls(self, uses_db: None, tmp_path: pathlib.Path) -> None:
+        """Null media columns export as empty string in CSV."""
+        t = pxt.create_table('test_csv_media_nulls', {'c_name': pxt.String, 'c_image': pxt.Image})
+        original_image = get_image_files()[0]
+        t.insert([{'c_name': 'has_image', 'c_image': original_image}, {'c_name': 'no_image', 'c_image': None}])
+
+        csv_path = tmp_path / 'media_nulls.csv'
+        pxt.io.export_csv(t, csv_path)
+
+        with open(csv_path, encoding='utf-8') as f:
+            exported = list(csv.DictReader(f))
+
+        row_with = next(r for r in exported if r['c_name'] == 'has_image')
+        assert row_with['c_image'] == original_image
+        assert '.pixeltable' not in row_with['c_image']
+
+        row_without = next(r for r in exported if r['c_name'] == 'no_image')
+        assert row_without['c_image'] == ''
+
+    def test_normalize_media_url(self) -> None:
+        """normalize_media_url converts file:// URLs to paths and passes remote URLs through."""
+        assert normalize_media_url('file:///tmp/test/image.jpg') == '/tmp/test/image.jpg'
+        assert normalize_media_url('file:///tmp/test%20dir/image.jpg') == '/tmp/test dir/image.jpg'
+        assert normalize_media_url('https://example.com/image.jpg') == 'https://example.com/image.jpg'
+        assert normalize_media_url('s3://bucket/key.jpg') == 's3://bucket/key.jpg'
+        assert normalize_media_url(None) is None

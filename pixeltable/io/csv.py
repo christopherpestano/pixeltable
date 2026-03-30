@@ -61,7 +61,7 @@ def export_csv(
     - Json: JSON-encoded string
     - Array: JSON-encoded string (via `tolist()`)
     - Binary: excluded from export (not representable in CSV)
-    - Image, Video, Audio, Document: file path or URL string
+    - Image, Video, Audio, Document: authoritative file path or remote URL string
 
     Args:
         table_or_query: Table or Query to export.
@@ -69,10 +69,9 @@ def export_csv(
         delimiter: Field delimiter character. Default `','`.
         quoting: CSV quoting style (a `csv.QUOTE_*` constant). Default `csv.QUOTE_MINIMAL`.
     """
-    if isinstance(table_or_query, pxt.catalog.Table):
-        query = table_or_query.select()
-    else:
-        query = table_or_query
+    from pixeltable.io.utils import normalize_media_url, resolve_media_to_urls
+
+    query, media_cols = resolve_media_to_urls(table_or_query)
 
     col_types: dict[str, ts.ColumnType] = {name: ct for name, ct in query.schema.items() if not ct.is_binary_type()}
 
@@ -91,8 +90,8 @@ def export_csv(
                 val = row[col_name]
                 if val is None:
                     csv_row.append('')
-                elif col_type.is_image_type():
-                    csv_row.append(str(val.filename) if hasattr(val, 'filename') and val.filename else '')
+                elif col_name in media_cols:
+                    csv_row.append(normalize_media_url(val) or '')
                 elif col_type.is_timestamp_type() or col_type.is_date_type():
                     csv_row.append(val.isoformat())
                 elif col_type.is_json_type():

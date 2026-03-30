@@ -1,9 +1,17 @@
+from __future__ import annotations
+
+import typing
+import urllib.parse
+import urllib.request
 from keyword import iskeyword as is_python_keyword
 from typing import Any
 
 import pixeltable as pxt
 import pixeltable.exceptions as excs
 from pixeltable.catalog.globals import is_system_column_name
+
+if typing.TYPE_CHECKING:
+    import pixeltable as pxt
 
 
 def normalize_pxt_col_name(name: str) -> str:
@@ -98,3 +106,66 @@ def normalize_schema_names(
     pxt_pk = [col_mapping[pk] for pk in primary_key] if col_mapping is not None else primary_key
 
     return schema, pxt_pk, col_mapping
+
+
+def resolve_media_to_urls(table_or_query: pxt.Table | pxt.Query) -> tuple[pxt.Query, set[str]]:
+    """Replace media column references in a query with their .fileurl equivalents for export.
+
+    For each media column (Image, Video, Audio, Document) backed by a stored ColumnRef,
+    the column is swapped to its .fileurl property so the exported value is the authoritative
+    URL (remote URL for remote files, file:// URL for local files) rather than a local
+    cache or media-store path.
+
+    Returns:
+        A tuple of (modified_query, media_col_names) where media_col_names is the set of
+        column names that were converted to URL strings.
+    """
+    from pixeltable._query import Query
+    from pixeltable.exprs import ColumnRef
+    from pixeltable.exprs.column_property_ref import ColumnPropertyRef
+
+    if isinstance(table_or_query, pxt.catalog.Table):
+        query = table_or_query.select()
+    else:
+        query = table_or_query
+
+    new_select_list: list[tuple] = []
+    media_col_names: set[str] = set()
+
+    for name, expr in zip(query.schema.keys(), query._select_list_exprs):
+        col_type = query.schema[name]
+        if (
+            col_type.is_media_type()
+            and isinstance(expr, ColumnRef)
+            and (not expr.col.is_computed or expr.col.is_stored)
+        ):
+            new_select_list.append((ColumnPropertyRef(expr, ColumnPropertyRef.Property.FILEURL), name))
+            media_col_names.add(name)
+        else:
+            new_select_list.append((expr, name))
+
+    if not media_col_names:
+        return query, media_col_names
+
+    new_query = Query(
+        from_clause=query._from_clause,
+        select_list=new_select_list,
+        where_clause=query.where_clause,
+        group_by_clause=query.group_by_clause,
+        grouping_tbl=query.grouping_tbl,
+        order_by_clause=query.order_by_clause,
+        limit=query.limit_val,
+        offset=query.offset_val,
+        sample_clause=query.sample_clause,
+    )
+    return new_query, media_col_names
+
+
+def normalize_media_url(url: str | None) -> str | None:
+    """Convert a file:// URL to a plain filesystem path; pass remote URLs through unchanged."""
+    if url is None:
+        return None
+    if url.startswith('file:'):
+        parsed = urllib.parse.urlparse(url)
+        return urllib.request.url2pathname(parsed.path)
+    return url

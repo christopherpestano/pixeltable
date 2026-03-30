@@ -69,18 +69,16 @@ def export_json(table_or_query: pxt.Table | pxt.Query, file_path: str | Path, *,
     - Json: native JSON value (object, array, etc.)
     - Array: nested JSON array (via `tolist()`)
     - Binary: excluded from export (not representable in JSON)
-    - Image, Video, Audio, Document: file path or URL string
+    - Image, Video, Audio, Document: authoritative file path or remote URL string
 
     Args:
         table_or_query: Table or Query to export.
         file_path: Path to the output JSON file.
         indent: Number of spaces for pretty-printing indentation. Default `None` (compact output).
     """
+    from pixeltable.io.utils import normalize_media_url, resolve_media_to_urls
 
-    if isinstance(table_or_query, pxt.catalog.Table):
-        query = table_or_query.select()
-    else:
-        query = table_or_query
+    query, media_cols = resolve_media_to_urls(table_or_query)
 
     col_types: dict[str, ts.ColumnType] = {name: ct for name, ct in query.schema.items() if not ct.is_binary_type()}
 
@@ -97,8 +95,8 @@ def export_json(table_or_query: pxt.Table | pxt.Query, file_path: str | Path, *,
 
             if val is None:
                 row_dict[col_name] = None
-            elif col_type.is_image_type():
-                row_dict[col_name] = str(val.filename) if hasattr(val, 'filename') and val.filename else None
+            elif col_name in media_cols:
+                row_dict[col_name] = normalize_media_url(val)
             elif col_type.is_timestamp_type() or col_type.is_date_type():
                 row_dict[col_name] = val.isoformat()
             elif col_type.is_uuid_type():
