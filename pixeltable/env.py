@@ -1110,7 +1110,7 @@ class RateLimitInfo:
 
         now = datetime.datetime.now(tz=datetime.timezone.utc)
         time_until = (target_remaining - self.remaining) / refill_rate - (now - self.request_start_ts).total_seconds()
-        return max(0, math.ceil(time_until))
+        return max(0.0, time_until)
 
     def __repr__(self) -> str:
         return (
