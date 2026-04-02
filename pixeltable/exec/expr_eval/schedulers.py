@@ -7,7 +7,7 @@ import logging
 import math
 import sys
 import time
-from typing import Awaitable, Collection
+from typing import Any, Awaitable, Collection
 
 from pixeltable import env, exceptions as excs, func
 from pixeltable.config import Config
@@ -142,36 +142,36 @@ class RateLimitsScheduler(Scheduler):
 
     def _get_request_resources(self, request: FnCallArgs) -> dict[str, int]:
         estimator = request.fn_call.fn._resource_estimator
-        param_names = [p.name for p in inspect.signature(estimator).parameters.values() if p.name != '_param_types']
-        if len(param_names) == 0:
-            result = estimator()
-        else:
+        sig = inspect.signature(estimator)
+        has_param_types = '_param_types' in sig.parameters
+        param_names = [p.name for p in sig.parameters.values() if p.name != '_param_types']
+
+        kwargs: dict[str, Any] = {}
+        if len(param_names) > 0:
             extra = set(param_names) - set(request.fn_call.fn.signature.parameters.keys())
             if extra:
                 fn = request.fn_call.fn
                 raise excs.Error(
                     f'resource_estimator for {fn.self_path or fn} has parameters '
-                    f'{extra} that are not in the resolved function signature'
+                    f'{", ".join(sorted(extra))!r} that are not in the resolved function signature'
                 )
             per_row_kwargs = request.fn_call.get_param_values(param_names, request.rows)
-            # If the estimator declares '_param_types', inject a dict mapping param names to Pixeltable
-            # ColumnTypes for the resolved overload. This lets a shared estimator on a polymorphic function
-            # distinguish overloads that share the same Python types (e.g., str for Document vs Video).
-            has_param_types = '_param_types' in inspect.signature(estimator).parameters
             if not request.is_batched:
-                if has_param_types:
-                    param_types = {name: p.col_type for name, p in request.fn_call.fn.signature.parameters.items()}
-                    per_row_kwargs[0]['_param_types'] = param_types
-                result = estimator(**per_row_kwargs[0])
+                kwargs = per_row_kwargs[0]
             else:
                 columnar_kwargs = {k: [d[k] for d in per_row_kwargs] for k in per_row_kwargs[0]}
                 constant_kwargs, batched_kwargs = request.pxt_fn.create_batch_kwargs(columnar_kwargs)
-                if has_param_types:
-                    param_types = {name: p.col_type for name, p in request.fn_call.fn.signature.parameters.items()}
-                    constant_kwargs['_param_types'] = param_types
-                result = estimator(**constant_kwargs, **batched_kwargs)
-        # Filter to resources known to the pool to avoid KeyError in _resource_delay(), this is done
-        # because some providers do not report resources so rate limiting can only be done off of config
+                kwargs = {**constant_kwargs, **batched_kwargs}
+
+        # If the estimator declares '_param_types', inject a dict mapping param names to Pixeltable
+        # ColumnTypes for the resolved overload. This lets a shared estimator on a polymorphic function
+        # distinguish overloads that share the same Python types (e.g., str for Document vs Video).
+        if has_param_types:
+            kwargs['_param_types'] = {name: p.col_type for name, p in request.fn_call.fn.signature.parameters.items()}
+
+        result = estimator(**kwargs)
+        # Filter to resources known to the pool to avoid KeyError in _resource_delay(); some providers
+        # do not report resources so rate limiting can only be done off of config
         known = self._resources
         return {k: v for k, v in result.items() if k in known}
 
