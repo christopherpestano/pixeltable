@@ -86,6 +86,14 @@ class TestPrimaryKeyIndex:
         assert t.collect()['id'] == [1]
         assert t.collect()['v'] == ['a']
 
+    def test_intra_batch_duplicate_rejected(self, uses_db: None) -> None:
+        """Duplicate PKs within a single batch are rejected even when the table is empty."""
+        t = pxt.create_table('test_pk', {'id': pxt.Required[pxt.Int], 'v': pxt.String}, primary_key='id')
+
+        with pytest.raises(pxt.Error, match='Duplicate primary key'):
+            t.insert([{'id': 1, 'v': 'a'}, {'id': 1, 'v': 'b'}])
+        assert t.count() == 0
+
     def test_batch_update_with_pk_index(self, uses_db: None) -> None:
         """batch_update works correctly with the PK index: updates expire the old version."""
         t = pxt.create_table('test_pk', {'id': pxt.Required[pxt.Int], 'val': pxt.Int}, primary_key='id')

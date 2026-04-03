@@ -74,5 +74,4 @@ def _table_modifier(conn: sql.Connection, tbl_id: UUID, orig_table_md: dict, upd
         conn.execute(sql.text('RELEASE SAVEPOINT pk_index_attempt'))
         for col_id in pk_col_ids:
             updated_table_md['column_md'][str(col_id)]['is_pk'] = False
-
-    conn.execute(sql.update(Table).where(Table.id == tbl_id).values(md=updated_table_md))
+        conn.execute(sql.update(Table).where(Table.id == tbl_id).values(md=updated_table_md))
