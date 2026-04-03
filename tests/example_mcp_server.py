@@ -23,4 +23,4 @@ def pixeldict(d: dict[str, Any] | None) -> dict[str, Any]:
 
 
 if __name__ == '__main__':
-    mcp.run(transport='streamable-http')
+    mcp.run(transport='streamable-http', host='127.0.0.1', port=8000)

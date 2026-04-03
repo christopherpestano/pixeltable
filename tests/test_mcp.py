@@ -1,4 +1,5 @@
 import logging
+import socket
 import subprocess
 import sys
 import time
@@ -12,12 +13,14 @@ from .utils import skip_test_if_no_client, skip_test_if_not_installed
 
 _logger = logging.getLogger('pixeltable')
 
+MCP_SERVER_URL = 'http://127.0.0.1:8000/mcp'
+
 
 class TestMcp:
     def test_mcp_server(self, uses_db: None, init_mcp_server: None) -> None:
         skip_test_if_not_installed('mcp')
 
-        udfs = pxt.mcp_udfs('http://localhost:8000/mcp')
+        udfs = pxt.mcp_udfs(MCP_SERVER_URL)
         assert udfs[0].name == 'pixelmultiple'
         assert udfs[0].comment() == 'Computes the Pixelmultiple of two integers.'
         assert udfs[1].name == 'pixeldict'
@@ -36,7 +39,7 @@ class TestMcp:
         skip_test_if_no_client('openai')
         from pixeltable.functions import openai
 
-        udfs = pxt.mcp_udfs('http://localhost:8000/mcp')
+        udfs = pxt.mcp_udfs(MCP_SERVER_URL)
         tools = pxt.tools(*udfs)
 
         t = pxt.create_table('test_mcp', {'prompt': pxt.String})
@@ -48,13 +51,27 @@ class TestMcp:
         assert res[0]['tool_calls'] == {'pixelmultiple': [str((7 + 22) * 9)], 'pixeldict': None}
 
 
+def _wait_for_server(host: str, port: int, timeout: float, process: subprocess.Popen[bytes]) -> None:
+    """Poll until the server accepts TCP connections or the timeout expires."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(f'MCP server process exited with code {process.returncode}')
+        try:
+            with socket.create_connection((host, port), timeout=1):
+                return
+        except OSError:
+            time.sleep(0.5)
+    raise TimeoutError(f'MCP server on {host}:{port} did not start within {timeout}s')
+
+
 @pytest.fixture(scope='session')
 def init_mcp_server(init_env: None) -> Iterator[None]:
     skip_test_if_not_installed('mcp')
 
     _logger.info('Starting MCP server pytest fixture.')
     mcp_process = subprocess.Popen([sys.executable, 'tests/example_mcp_server.py'])
-    time.sleep(5)  # Wait for the MCP server to start
+    _wait_for_server('127.0.0.1', 8000, timeout=30, process=mcp_process)
     yield
 
     _logger.info('Terminating MCP server pytest fixture.')
