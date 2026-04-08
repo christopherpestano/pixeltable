@@ -6,8 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import pixeltable as pxt
-import pixeltable.type_system as ts
-from pixeltable.io.utils import replace_media_with_fileurl
+from pixeltable.io.utils import collect_for_export
 
 if typing.TYPE_CHECKING:
     import pixeltable as pxt
@@ -79,17 +78,7 @@ def export_json(table_or_query: pxt.Table | pxt.Query, file_path: str | Path, *,
         indent: Number of spaces for pretty-printing indentation. Default `None` (compact output).
     """
 
-    query: pxt.Query
-    if isinstance(table_or_query, pxt.catalog.Table):
-        query = table_or_query.select()
-    else:
-        query = table_or_query
-
-    replace_media_with_fileurl(query._select_list_exprs)
-
-    col_types: dict[str, ts.ColumnType] = {name: ct for name, ct in query.schema.items() if not ct.is_binary_type()}
-
-    result = query.collect()
+    result, col_types = collect_for_export(table_or_query)
 
     file_path = Path(file_path)
     file_path.parent.mkdir(parents=True, exist_ok=True)
