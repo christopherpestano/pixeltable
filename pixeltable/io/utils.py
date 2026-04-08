@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import typing
 from keyword import iskeyword as is_python_keyword
 from typing import Any
 
 import pixeltable as pxt
 import pixeltable.exceptions as excs
+import pixeltable.type_system as ts
 from pixeltable.catalog.globals import is_system_column_name
 from pixeltable.exprs.column_property_ref import ColumnPropertyRef
 from pixeltable.exprs.column_ref import ColumnRef
 from pixeltable.exprs.expr import Expr
+
+if typing.TYPE_CHECKING:
+    from pixeltable._query import ResultSet
 
 
 def normalize_pxt_col_name(name: str) -> str:
@@ -119,3 +124,35 @@ def replace_media_with_fileurl(select_list_exprs: list[Expr]) -> None:
                     f'Set a destination on the column or select specific non-media columns instead.'
                 )
             select_list_exprs[i] = ColumnPropertyRef(expr, ColumnPropertyRef.Property.FILEURL)
+
+
+def collect_for_export(table_or_query: pxt.Table | pxt.Query) -> tuple[ResultSet, dict[str, ts.ColumnType]]:
+    """Prepare a table or query for file export and collect results.
+
+    Replaces media columns with their fileurl property (so export gets authoritative URLs
+    instead of cached paths), filters out binary columns (not representable in CSV/JSON),
+    and collects the result set.
+
+    Works on a copy of the query's select list to avoid permanently mutating
+    a caller-provided Query object.
+
+    Returns:
+        A tuple of (collected ResultSet, column-name-to-type dict excluding binary columns).
+    """
+    if isinstance(table_or_query, pxt.catalog.Table):
+        query = table_or_query.select()
+    else:
+        query = table_or_query
+
+    # Work on a shallow copy of the select list so replace_media_with_fileurl
+    # does not permanently mutate a user-provided Query.
+    original_exprs = query._select_list_exprs
+    query._select_list_exprs = list(original_exprs)
+    try:
+        replace_media_with_fileurl(query._select_list_exprs)
+        col_types: dict[str, ts.ColumnType] = {name: ct for name, ct in query.schema.items() if not ct.is_binary_type()}
+        result = query.collect()
+    finally:
+        query._select_list_exprs = original_exprs
+
+    return result, col_types

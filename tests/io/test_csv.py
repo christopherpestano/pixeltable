@@ -8,7 +8,7 @@ import pytest
 
 import pixeltable as pxt
 
-from ..utils import create_all_datatypes_tbl, create_test_tbl, get_csv_file, validate_update_status
+from ..utils import create_all_datatypes_tbl, create_test_tbl, get_csv_file, get_image_files, validate_update_status
 
 
 class TestCsv:
@@ -112,6 +112,15 @@ class TestCsv:
             exported = list(csv.DictReader(f))
         assert len(exported) == 10
         assert list(exported[0].keys()) == ['c_string']
+
+    def test_export_computed_media_without_destination_errors(self, uses_db: None, tmp_path: pathlib.Path) -> None:
+        """Exporting a computed media column without a destination should raise an error."""
+        t = pxt.create_table('test_csv_no_dest', {'img': pxt.Image})
+        t.add_computed_column(rotated=t.img.rotate(90))
+        t.insert([{'img': get_image_files()[0]}])
+
+        with pytest.raises(pxt.Error, match='without a destination'):
+            pxt.io.export_csv(t, tmp_path / 'should_fail.csv')
 
     @pytest.mark.parametrize('delimiter', ['\t', ';', '|'])
     def test_export_custom_delimiter(self, uses_db: None, tmp_path: pathlib.Path, delimiter: str) -> None:

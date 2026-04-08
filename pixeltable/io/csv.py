@@ -8,8 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pixeltable as pxt
-import pixeltable.type_system as ts
-from pixeltable.io.utils import replace_media_with_fileurl
+from pixeltable.io.utils import collect_for_export
 
 if typing.TYPE_CHECKING:
     import pixeltable as pxt
@@ -71,17 +70,7 @@ def export_csv(
         quoting: CSV quoting style (a `csv.QUOTE_*` constant). Default `csv.QUOTE_MINIMAL`.
     """
 
-    query: pxt.Query
-    if isinstance(table_or_query, pxt.catalog.Table):
-        query = table_or_query.select()
-    else:
-        query = table_or_query
-
-    replace_media_with_fileurl(query._select_list_exprs)
-
-    col_types: dict[str, ts.ColumnType] = {name: ct for name, ct in query.schema.items() if not ct.is_binary_type()}
-
-    result = query.collect()
+    result, col_types = collect_for_export(table_or_query)
 
     file_path = Path(file_path)
     file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -98,6 +87,8 @@ def export_csv(
                     csv_row.append('')
                 elif col_type.is_timestamp_type() or col_type.is_date_type():
                     csv_row.append(val.isoformat())
+                elif col_type.is_uuid_type():
+                    csv_row.append(str(val))
                 elif col_type.is_json_type():
                     csv_row.append(json.dumps(val))
                 elif col_type.is_array_type():
