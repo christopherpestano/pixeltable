@@ -303,7 +303,8 @@ async def _generate_videos_impl(
     video = operation.response.generated_videos[0]
 
     video_bytes = await _genai_client().aio.files.download(file=video.video)  # type: ignore[arg-type]
-    assert video_bytes is not None
+    if video_bytes is None:
+        raise excs.Error(f'Video generation for Gemini model {model!r} returned empty content.')
 
     output_path = TempStore.create_path(extension='.mp4')
     Path(output_path).write_bytes(video_bytes)
@@ -355,7 +356,7 @@ async def generate_videos(
         >>> tbl.add_computed_column(
         ...     response=generate_videos(
         ...         tbl.prompt,
-        ...         image=[tbl.ref_img1, tbl.ref_img2],
+        ...         images=[tbl.ref_img1, tbl.ref_img2],
         ...         reference_types=['asset', 'asset'],
         ...         model='veo-3.1-generate-preview',
         ...     )
@@ -433,6 +434,30 @@ def _(model: str) -> str:
     return f'rate-limits:gemini:{model}'
 
 
+def _extract_tts_audio(response: Any, model: str, label: str = 'TTS') -> bytes:
+    """Extract raw audio bytes from a Gemini TTS response, decoding base64 if needed."""
+    try:
+        data = response.candidates[0].content.parts[0].inline_data.data
+    except (IndexError, AttributeError) as exc:
+        raise excs.Error(f'Gemini {label} returned unexpected response structure for model {model}.') from exc
+    if isinstance(data, str):
+        data = base64.b64decode(data)
+    return data
+
+
+def _write_wav(data: bytes) -> str:
+    """Write raw 24 kHz mono 16-bit PCM data to a temporary WAV file and return its path."""
+    import wave
+
+    output_path = str(TempStore.create_path(extension='.wav'))
+    with wave.open(output_path, 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(24000)
+        wf.writeframes(data)
+    return output_path
+
+
 @pxt.udf(is_deterministic=False)
 async def generate_speech(text: str, *, model: str, voice: str, config: dict | None = None) -> pxt.Audio:
     """
@@ -453,9 +478,7 @@ async def generate_speech(text: str, *, model: str, voice: str, config: dict | N
         voice: The voice profile to use. Supported voices include `'Kore'`, `'Puck'`, `'Charon'`,
             `'Fenrir'`, `'Aoede'`, `'Leda'`, `'Orus'`, `'Zephyr'`, and others. See the
             [speech generation docs](https://ai.google.dev/gemini-api/docs/speech-generation) for the full list.
-            Mutually exclusive with `voices`.
-        voices: A mapping from speaker alias (as used in the text) to voice name. For example,
-            `{'Alice': 'Kore', 'Bob': 'Puck'}`. Mutually exclusive with `voice`.
+            For multi-speaker synthesis, use the overloaded signature with `voices` instead.
         config: Additional configuration, corresponding to keyword arguments of
             `genai.types.GenerateContentConfig`. Keys such as `response_modalities` and `speech_config`
             are set automatically and should not be included.
@@ -473,8 +496,6 @@ async def generate_speech(text: str, *, model: str, voice: str, config: dict | N
         ... )
     """
     env.Env.get().require_package('google.genai')
-    import wave
-
     from google.genai import types
 
     resource_pool_id = f'rate-limits:gemini:{model}'
@@ -487,20 +508,7 @@ async def generate_speech(text: str, *, model: str, voice: str, config: dict | N
     )
 
     response = await _genai_client().aio.models.generate_content(model=model, contents=text, config=config_)
-    try:
-        data = response.candidates[0].content.parts[0].inline_data.data
-    except (IndexError, AttributeError) as exc:
-        raise excs.Error(f'Gemini TTS returned unexpected response structure for model {model}.') from exc
-    if isinstance(data, str):
-        data = base64.b64decode(data)
-
-    output_path = str(TempStore.create_path(extension='.wav'))
-    with wave.open(output_path, 'wb') as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(24000)
-        wf.writeframes(data)
-    return output_path
+    return _write_wav(_extract_tts_audio(response, model))
 
 
 @generate_speech.overload
@@ -531,8 +539,6 @@ async def _(text: str, *, model: str, voices: dict[str, str], config: dict | Non
         ...     )
         ... )
     """
-    import wave
-
     env.Env.get().require_package('google.genai')
     from google.genai import types
 
@@ -556,20 +562,7 @@ async def _(text: str, *, model: str, voices: dict[str, str], config: dict | Non
     )
 
     response = await _genai_client().aio.models.generate_content(model=model, contents=text, config=config_)
-    try:
-        data = response.candidates[0].content.parts[0].inline_data.data
-    except (IndexError, AttributeError) as exc:
-        raise excs.Error(f'Gemini multi-speaker TTS returned unexpected response structure for model {model}.') from exc
-    if isinstance(data, str):
-        data = base64.b64decode(data)
-
-    output_path = str(TempStore.create_path(extension='.wav'))
-    with wave.open(output_path, 'wb') as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(24000)
-        wf.writeframes(data)
-    return output_path
+    return _write_wav(_extract_tts_audio(response, model, label='multi-speaker TTS'))
 
 
 @generate_speech.resource_pool
@@ -606,7 +599,11 @@ async def transcribe(audio: pxt.Audio, *, model: str, prompt: str, config: dict 
         Add a computed column that transcribes audio:
 
         >>> tbl.add_computed_column(
-        ...     transcript=transcribe(tbl.audio, model='gemini-2.5-flash')
+        ...     transcript=transcribe(
+        ...         tbl.audio,
+        ...         model='gemini-2.5-flash',
+        ...         prompt='Transcribe this audio.',
+        ...     )
         ... )
     """
     env.Env.get().require_package('google.genai')
@@ -645,7 +642,12 @@ async def transcribe(audio: pxt.Audio, *, model: str, prompt: str, config: dict 
             config=config_,
         )
 
-    return response.text
+    text = response.text
+    if text is None:
+        raise excs.Error(
+            f'Gemini transcription returned no text for model {model}. The response may have been filtered.'
+        )
+    return text
 
 
 @transcribe.resource_pool
