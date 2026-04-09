@@ -14,13 +14,19 @@ from datetime import datetime, timezone
 from typing import Literal, NamedTuple, NoReturn
 
 
+# Retry args for transient HTTP errors from external services (e.g. HuggingFace 503s)
+_RERUN_TRANSIENT = "--reruns 2 --only-rerun '503 Server Error'"
+
+BASIC_PLATFORMS = ('ubuntu-24.04', 'macos-15', 'windows-2022')
+
+
 class MatrixConfig(NamedTuple):
     display_name_prefix: str
     test_category: Literal['py', 'ipynb', 'lint', 'random-ops']
     os: str
     python_version: str
     uv_options: str = ''
-    pytest_options: str = "-m 'not expensive and not benchmark'"
+    pytest_options: str = f"{_RERUN_TRANSIENT} -m 'not expensive and not benchmark'"
     pre_test_cmd: str = ''  # Extra bash command to be run just before tests
 
     @property
@@ -40,7 +46,6 @@ class MatrixConfig(NamedTuple):
         }
 
 
-BASIC_PLATFORMS = ('ubuntu-24.04', 'macos-15', 'windows-2022')
 EXPENSIVE_PLATFORMS = ('ubuntu-small-t4',)
 ALTERNATIVE_PLATFORMS = ('ubuntu-24.04-arm', 'macos-15-intel')
 
@@ -78,7 +83,11 @@ def generate_matrix(args: argparse.Namespace) -> None:
             'py',
             os,
             '3.10',
-            pytest_options="-m 'not benchmark'" if os.startswith('ubuntu') else "-m 'not expensive and not benchmark'",
+            pytest_options=(
+                f"{_RERUN_TRANSIENT} -m 'not benchmark'"
+                if os.startswith('ubuntu')
+                else f"{_RERUN_TRANSIENT} -m 'not expensive and not benchmark'"
+            ),
         )
         for os in (
             # Same as BASIC_PLATFORMS, but upgrade the Ubuntu VM for non-PR triggers.
