@@ -998,7 +998,7 @@ class TestQuery:
 
         # schema
         cur = query.cursor()
-        assert list(cur._schema.keys()) == ['c1', 'c2', 'c3']
+        assert list(cur.schema.keys()) == ['c1', 'c2', 'c3']
 
     def test_cursor_row(self, test_tbl: pxt.Table) -> None:
         query = test_tbl.select(test_tbl.c1, test_tbl.c2, test_tbl.c3).order_by(test_tbl.c2)
@@ -1019,7 +1019,11 @@ class TestQuery:
                 assert 'c1' in row
                 assert 'nonexistent' not in row
                 assert len(row) == 3
-                # missing key
+                # get() returns default for missing key
+                assert row.get('c1') == row['c1']
+                assert row.get('nonexistent') is None
+                assert row.get('nonexistent', 42) == 42
+                # __getitem__ raises for missing key
                 with pytest.raises(pxt.Error, match='does not exist'):
                     row['nonexistent']
 

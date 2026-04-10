@@ -244,7 +244,8 @@ class ResultCursor:
             self.close()
 
     @property
-    def _schema(self) -> dict[str, ColumnType]:
+    def schema(self) -> dict[str, ColumnType]:
+        """Column names and types in this cursor's query."""
         return self._query.schema
 
     def __repr__(self) -> str:
@@ -254,40 +255,8 @@ class ResultCursor:
             state = 'open'
         else:
             state = 'pending'
-        cols = ', '.join(f'{name}: {col_type}' for name, col_type in self._schema.items())
+        cols = ', '.join(f'{name}: {col_type}' for name, col_type in self.schema.items())
         return f'ResultCursor({state}, columns=[{cols}])'
-
-
-# # TODO: remove this; it's only here as a reminder that we still need to call release() in the current implementation
-# class AnalysisInfo:
-#     def __init__(self, tbl: catalog.TableVersion):
-#         self.tbl = tbl
-#         # output of the SQL scan stage
-#         self.sql_scan_output_exprs: list[exprs.Expr] = []
-#         # output of the agg stage
-#         self.agg_output_exprs: list[exprs.Expr] = []
-#         # Where clause of the Select stmt of the SQL scan stage
-#         self.sql_where_clause: sql.ClauseElement | None = None
-#         # filter predicate applied to input rows of the SQL scan stage
-#         self.filter: exprs.Predicate | None = None
-#         self.similarity_clause: exprs.ImageSimilarityPredicate | None = None
-#         self.agg_fn_calls: list[exprs.FunctionCall] = []  # derived from unique_exprs
-#         self.has_frame_col: bool = False  # True if we're referencing the frame col
-#
-#         self.evaluator: exprs.Evaluator | None = None
-#         self.sql_scan_eval_ctx: list[exprs.Expr] = []  # needed to materialize output of SQL scan stage
-#         self.agg_eval_ctx: list[exprs.Expr] = []  # needed to materialize output of agg stage
-#         self.filter_eval_ctx: list[exprs.Expr] = []
-#         self.group_by_eval_ctx: list[exprs.Expr] = []
-#
-#     def finalize_exec(self) -> None:
-#         """
-#         Call release() on all collected Exprs.
-#         """
-#         exprs.Expr.release_list(self.sql_scan_output_exprs)
-#         exprs.Expr.release_list(self.agg_output_exprs)
-#         if self.filter is not None:
-#             self.filter.release()
 
 
 class Query:
