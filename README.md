@@ -8,8 +8,9 @@
 <br>
 </div>
 
-The only open source Python library providing declarative, transactional data infrastructure for building multimodal AI applications — with incremental storage, transformation, indexing, retrieval, and orchestration of data, all with full operational integrity.
+Pixeltable turns multimodal AI pipelines into declarative tables. Insert data once, and storage, transforms, embeddings, and indexes keep themselves in sync.
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/pixeltable/pixeltable/blob/release/docs/release/overview/ten-minute-tour.ipynb)
 [![License](https://img.shields.io/badge/License-Apache%202.0-0530AD.svg)](https://opensource.org/licenses/Apache-2.0)
 [![PyPI Package](https://img.shields.io/pypi/v/pixeltable?color=4D148C)](https://pypi.org/project/pixeltable/)
 [![Python](https://img.shields.io/pypi/pyversions/pixeltable)](https://pypi.org/project/pixeltable/)
@@ -43,57 +44,39 @@ Define your data processing and AI workflow declaratively using
 Focus on your logic, not the data plumbing.
 
 ```bash
-pip install pixeltable google-genai torch transformers scenedetect
+pip install pixeltable google-genai
 ```
 
 Set your Gemini API key via environment variable or `~/.pixeltable/config.toml`. See [Configuration](https://docs.pixeltable.com/platform/configuration) for all provider keys and options.
 
 ```python
 import pixeltable as pxt
-from pixeltable.functions import gemini, huggingface
+from pixeltable.functions import gemini
 
-# 1. Store — structured data + media references, versioned and materialized automatically
-videos = pxt.create_table('video_search', {'video': pxt.Video, 'title': pxt.String})
+base_url = 'https://raw.githubusercontent.com/pixeltable/pixeltable/release/docs/resources'
 
-# 2. Orchestrate — computed columns are nodes in the table's DAG; the table is the pipeline
-videos.add_computed_column(scenes=videos.video.scene_detect_adaptive())
+# 1. Create a table with a multimodal column. Stored and versioned automatically.
+videos = pxt.create_table('demo', {'video': pxt.Video, 'title': pxt.String})
 
-# 3. AI integration — external API calls with rate limiting, retry, and async parallelism
+# 2. Add a computed column. The table is the pipeline.
 videos.add_computed_column(
-    response=gemini.generate_content(
-        [videos.video, 'Describe this video in detail.'], model='gemini-3-flash-preview'
-    )
+    description=gemini.generate_content(
+        [videos.video, 'Describe this video.'], model='gemini-3-flash-preview'
+    ).candidates[0].content.parts[0].text
 )
 
-# 4. JSON path expressions — extract nested fields with just-in-time typing
-videos.add_computed_column(
-    description=videos.response.candidates[0].content.parts[0].text
-)
-
-# 5. Incremental index maintenance — embedding indexes stay in sync, no ETL pipeline needed
+# 3. Add vector search in one line. No external service, no ETL.
 videos.add_embedding_index('video', embedding=gemini.embed_content.using(model='gemini-embedding-2-preview'))
 
-# Insert data — triggers the full pipeline automatically
-base_url = 'https://raw.githubusercontent.com/pixeltable/pixeltable/release/docs/resources'
+# 4. Insert. The pipeline runs automatically.
 videos.insert([
     {'video': f'{base_url}/bangkok.mp4', 'title': 'Bangkok Street Tour'},
     {'video': f'{base_url}/The-Pursuit-of-Happiness-Video-Extract.mp4', 'title': 'The Pursuit of Happiness'},
 ])
 
-# 6. Retrieve — structured + unstructured data side by side, with on-the-fly transforms
-videos.select(
-    videos.video,
-    videos.title,
-    videos.description,
-    detections=huggingface.detr_for_object_detection(
-        videos.video.extract_frame(timestamp=2.0),
-        model_id='facebook/detr-resnet-50',
-    ),
-).collect()
-
-# 7. Cross-modal search — find similar videos using a reference image, with filters
+# 5. Cross-modal search: find similar videos from a reference image.
 sim = videos.video.similarity(image=f'{base_url}/The-Pursuit-of-Happiness-Screenshot.png')
-videos.where(videos.description != None).order_by(sim, asc=False).limit(5).collect()
+videos.where(videos.description != None).order_by(sim, asc=False).limit(5).select(videos.title, videos.description).collect()
 ```
 
 ## What Pixeltable Does
