@@ -92,30 +92,24 @@ videos.where(videos.description != None).order_by(sim, asc=False).limit(5).selec
 | `table.select(...).collect()` | Returns structured + unstructured data together |
 | *(nothing — it's automatic)* | Versions all data and schema changes for time-travel |
 
-That single workflow replaces most of the typical AI stack:
-
-| Instead of ... | Pixeltable gives you ... |
-|---|---|
-| PostgreSQL / MySQL | `pxt.create_table()` — schema is Python, versioned automatically |
-| pgAdmin / Retool.. | Built-in local dashboard — auto-launches, zero config |
-| Pinecone / Weaviate / Qdrant | `add_embedding_index()` — one line, stays in sync |
-| S3 / boto3 / blob storage | `pxt.Image` / `Video` / `Audio` / `Document` types with caching; `destination='s3://...'` |
-| Airflow / Prefect / Celery | Computed columns trigger on insert — no orchestrator needed |
-| LangChain / LlamaIndex (RAG) | `@pxt.query` + `.similarity()` + computed column chaining |
-| pandas / polars (multimodal) | `.sample()`, ephemeral UDFs, then `add_computed_column()` |
-| DVC / MLflow / W&B | Built-in `history()`, `revert()`, time travel (`table:N`), snapshots |
-| Custom retry / rate-limit / caching | Built into every AI integration; results cached, only new rows recomputed |
-| Custom ETL / glue code | Declarative schema — Pixeltable handles execution, caching, incremental updates |
-
-On top of these, Pixeltable ships with [built-in functions](https://docs.pixeltable.com/sdk/latest/pixeltable) for media processing (FFmpeg, Pillow, spaCy), embeddings (sentence-transformers, CLIP), and [30+ AI providers](https://docs.pixeltable.com/integrations/frameworks) (OpenAI, Anthropic, Gemini, Ollama, and more). For anything domain-specific, wrap your own logic with [`@pxt.udf`](https://docs.pixeltable.com/platform/udfs-in-pixeltable). You still write the application layer (FastAPI, React, Docker).
-
-**Deployment options:** Pixeltable can serve as your [full backend](https://docs.pixeltable.com/howto/deployment/overview) (managing media locally or syncing with S3/GCS/Azure, plus built-in vector search and orchestration) or as an [orchestration layer](https://docs.pixeltable.com/howto/deployment/overview) alongside your existing infrastructure.
-
 ## Demo
 
 See Pixeltable in action — table creation, computed columns, multimodal processing, and querying in a single workflow:
 
 https://github.com/user-attachments/assets/b50fd6df-5169-4881-9dbe-1b6e5d06cede
+
+Where Pixeltable fits in your stack:
+
+| Instead of... | Pixeltable gives you... |
+|---|---|
+| Vector DBs like Pinecone, Weaviate, Qdrant | `add_embedding_index()` in one line; the index stays in sync as data changes |
+| AI-pipeline orchestration with Airflow, Prefect, Celery | Computed columns run on insert; no DAG to define, no scheduler to run |
+| RAG glue with LangChain or LlamaIndex (retrieval side) | `@pxt.query` + `.similarity()` + computed column chaining in one table |
+| Custom retry / rate-limit / caching for LLM APIs | Built into every integration; results cached, only new rows recomputed |
+
+On top of these, Pixeltable ships with [built-in functions](https://docs.pixeltable.com/sdk/latest/pixeltable) for media processing (FFmpeg, Pillow, spaCy), embeddings (sentence-transformers, CLIP), and [30+ AI providers](https://docs.pixeltable.com/integrations/frameworks) (OpenAI, Anthropic, Gemini, Ollama, and more). For anything domain-specific, wrap your own logic with [`@pxt.udf`](https://docs.pixeltable.com/platform/udfs-in-pixeltable). You still write the application layer (FastAPI, React, Docker).
+
+**Deployment options:** Pixeltable can serve as your [full backend](https://docs.pixeltable.com/howto/deployment/overview) (managing media locally or syncing with S3/GCS/Azure, plus built-in vector search and orchestration) or as an [orchestration layer](https://docs.pixeltable.com/howto/deployment/overview) alongside your existing infrastructure.
 
 ## Core Capabilities
 
