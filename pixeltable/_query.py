@@ -302,7 +302,8 @@ class ResultCursor(Iterable[Row]):
             self.close()
 
     @property
-    def _schema(self) -> dict[str, ColumnType]:
+    def schema(self) -> dict[str, ColumnType]:
+        """Column names and types in this cursor's query."""
         return self._query.schema
 
     def __repr__(self) -> str:
@@ -312,7 +313,7 @@ class ResultCursor(Iterable[Row]):
             state = 'open'
         else:
             state = 'pending'
-        cols = ', '.join(f'{name}: {col_type}' for name, col_type in self._schema.items())
+        cols = ', '.join(f'{name}: {col_type}' for name, col_type in self.schema.items())
         return f'ResultCursor({state}, columns=[{cols}])'
 
 
