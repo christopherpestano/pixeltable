@@ -73,6 +73,10 @@ class SqlSourceNode(ExecNode):
         # Tables, subqueries, and aliases are not directly executable; wrap them in `select(...)`.
         src = self.sql_source.selectable
         stmt: sql.Executable = src if isinstance(src, sql.Executable) else sql.select(src)  # type: ignore[call-overload]
+        # `yield_per` flips `stream_results=True` for backends that support it (psycopg2, mysql, mssql+pyodbc),
+        # so a server-side cursor is used instead of buffering the entire result set client-side. On SQLite this
+        # is a no-op. Without this, the docstring promise of streaming is only true for SQLite.
+        stmt = stmt.execution_options(yield_per=self.BATCH_SIZE)
         try:
             self._result = self._conn.execute(stmt)
         except BaseException:
