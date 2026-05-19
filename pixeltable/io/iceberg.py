@@ -112,7 +112,8 @@ def export_iceberg(
         raise excs.RequestError(
             excs.ErrorCode.UNSUPPORTED_OPERATION,
             f'export_iceberg(): cannot infer a concrete type for JSON field(s) {null_paths} because every sampled '
-            f'value is None. Iceberg has no null-only type; you can specify an explicit type using the schema_overrides parameter.',
+            f'value is None. Iceberg has no null-only type; you can specify an explicit type using the '
+            f'schema_overrides parameter.',
         )
 
     catalog.create_namespace_if_not_exists(namespace)
@@ -148,7 +149,7 @@ def export_iceberg(
             raise
         except Exception as e:
             raise excs.RequestError(
-                excs.ErrorCode.INTERNAL_ERROR,
+                excs.ErrorCode.UNSUPPORTED_OPERATION,
                 f'export_iceberg(): failed to append to Iceberg table {table_name!r}: {e}',
             ) from e
         return
@@ -168,7 +169,7 @@ def export_iceberg(
     except Exception as e:
         catalog.drop_table(temp_name)
         raise excs.RequestError(
-            excs.ErrorCode.INTERNAL_ERROR, f'export_iceberg(): failed to write Iceberg table {table_name!r}: {e}'
+            excs.ErrorCode.UNSUPPORTED_OPERATION, f'export_iceberg(): failed to write Iceberg table {table_name!r}: {e}'
         ) from e
 
     if existing_tbl is not None:
