@@ -10,6 +10,7 @@ SKIP_NOTEBOOKS=(
     working-with-reve               # [PXT-1116] Out of credits
     working-with-runwayml           # [PXT-1120] RunwayML integration is very broken
     working-with-twelvelabs         # [PXT-1119] Exceeds rate limit
+    img-promptable-segmentation     # facebook/sam3 is gated; CI lacks HF token with access
 )
 
 # Notebooks that are skipped unless --include-expensive is passed
