@@ -1,0 +1,145 @@
+---
+title: "OpenTelemetry"
+description: "Emit OpenTelemetry traces and metrics from Pixeltable operations."
+---
+
+# OpenTelemetry
+
+Pixeltable ships with an **optional** OpenTelemetry instrumentation module that
+emits CLIENT spans and metrics around the core table operations (queries,
+inserts, updates, deletes). The instrumentation is grounded in the
+[OpenTelemetry database semantic conventions](https://opentelemetry.io/docs/specs/semconv/database/database-spans/),
+so the telemetry is recognizable to anyone familiar with the
+[`opentelemetry-instrumentation-sqlalchemy`](https://opentelemetry-python-contrib.readthedocs.io/en/latest/instrumentation/sqlalchemy/sqlalchemy.html)
+or Snowflake OTel integrations.
+
+When no `TracerProvider` / `MeterProvider` is configured by the host
+application, the instrumentation is a strict **no-op**: no spans are emitted,
+no metrics are recorded, and there is no measurable overhead.
+
+## Install the optional dependency
+
+The OpenTelemetry API/SDK are not bundled with the default install. Add the
+`otel` extra to opt in:
+
+```bash
+pip install 'pixeltable[otel]'
+```
+
+This adds three packages:
+
+- `opentelemetry-api`
+- `opentelemetry-sdk`
+- `opentelemetry-semantic-conventions`
+
+## Enable instrumentation
+
+Call `pixeltable.telemetry.otel.instrument()` once at process start, **after**
+configuring your application's `TracerProvider` and `MeterProvider`. The call
+is idempotent.
+
+```python
+from opentelemetry import trace, metrics
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader, ConsoleMetricExporter
+
+# 1. Configure your TracerProvider / MeterProvider (or use your existing setup).
+tracer_provider = TracerProvider()
+tracer_provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
+trace.set_tracer_provider(tracer_provider)
+
+reader = PeriodicExportingMetricReader(ConsoleMetricExporter())
+metrics.set_meter_provider(MeterProvider(metric_readers=[reader]))
+
+# 2. Instrument pixeltable.
+import pixeltable as pxt
+from pixeltable.telemetry import otel as pxt_otel
+pxt_otel.instrument()
+
+# 3. Use pixeltable normally. Spans and metrics will flow into your pipeline.
+t = pxt.create_table('demo', {'id': pxt.Required[pxt.Int]}, primary_key='id')
+t.insert([{'id': 1}])
+t.collect()
+```
+
+You can also run the bundled validation script for a quick smoke test:
+
+```bash
+python scripts/validate_otel.py
+```
+
+It configures stdout exporters, runs a few operations against a temporary
+local pixeltable instance, and prints the captured spans / metrics.
+
+## Spans emitted
+
+All spans are kind **CLIENT** with `db.system="pixeltable"`. They follow the
+OTel database semantic conventions.
+
+| Span name                       | Pixeltable entry-point                                  | Notable attributes                                                  |
+|---------------------------------|---------------------------------------------------------|---------------------------------------------------------------------|
+| `pixeltable.query.collect`      | `Query.collect` (incl. `Table.collect/show/head/tail`)  | `db.system`, `db.operation=select`, `pixeltable.first_table`, `pixeltable.row_count` |
+| `pixeltable.query.count`        | `Query.count` (incl. `Table.count`)                     | `db.system`, `db.operation=select`, `pixeltable.first_table`        |
+| `pixeltable.table.insert`       | `InsertableTable.insert`                                | `db.system`, `db.operation=insert`, `db.name`, `pixeltable.row_count` |
+| `pixeltable.table.update`       | `Table.update`                                          | `db.system`, `db.operation=update`, `db.name`, `pixeltable.cascade` |
+| `pixeltable.table.batch_update` | `Table.batch_update`                                    | `db.system`, `db.operation=update`, `db.name`                       |
+| `pixeltable.table.delete`       | `InsertableTable.delete`                                | `db.system`, `db.operation=delete`, `db.name`                       |
+
+On failure, the span's status is set to `ERROR` and the exception is recorded
+via `span.record_exception()`.
+
+## Metrics emitted
+
+| Instrument name             | Type            | Unit | Description                                            |
+|-----------------------------|-----------------|------|--------------------------------------------------------|
+| `pixeltable.query.duration` | Histogram       | `s`  | Wall-clock duration of a pixeltable operation.         |
+| `pixeltable.query.count`    | Counter         | `1`  | Number of pixeltable operations that completed.        |
+| `pixeltable.query.errors`   | Counter         | `1`  | Number of pixeltable operations that raised.           |
+| `pixeltable.query.active`   | UpDownCounter   | `1`  | Number of currently-in-flight pixeltable operations.   |
+
+All metrics carry at minimum `db.system="pixeltable"` and `db.operation`. The
+`pixeltable.query.errors` counter additionally carries `error.type`, the
+fully-qualified exception class name.
+
+## Resource attributes
+
+The instrumentation does **not** install its own `Resource` -- the host
+application owns the provider configuration. When you build your
+`TracerProvider` / `MeterProvider`, attach the following resource attributes
+so the emitted telemetry is identifiable:
+
+| Resource attribute | Value                                 |
+|--------------------|---------------------------------------|
+| `service.name`     | `"pixeltable"`                        |
+| `service.version`  | `pixeltable.__version__`              |
+
+```python
+from opentelemetry.sdk.resources import Resource
+import pixeltable
+
+resource = Resource.create({
+    'service.name': 'pixeltable',
+    'service.version': pixeltable.__version__,
+})
+tracer_provider = TracerProvider(resource=resource)
+```
+
+## Behavior when not configured
+
+`pixeltable.telemetry.otel.instrument()` may be called before the host
+configures any provider. In that case `opentelemetry.trace.get_tracer(...)`
+returns a no-op proxy tracer and `opentelemetry.metrics.get_meter(...)`
+returns a no-op proxy meter. No spans are emitted and no metric data points
+are recorded -- the instrumentation adds no measurable overhead.
+
+This is verified by a dedicated unit test (`test_no_provider_is_no_op`).
+
+## Importing `pixeltable` without the extra
+
+`pixeltable` imports cleanly when the `otel` extra is **not** installed --
+`pixeltable.telemetry` is a lazy entry point that does not import the OTel
+SDK at module load time. Only calling `pixeltable.telemetry.otel.instrument()`
+triggers the import; if the SDK is missing, you'll see a clear `ImportError`
+pointing at the `otel` extra.
