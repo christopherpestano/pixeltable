@@ -11,7 +11,18 @@ import pytest
 
 import pixeltable as pxt
 
-_OTEL_INSTALLED = find_spec('opentelemetry.sdk') is not None
+
+def _otel_installed() -> bool:
+    # find_spec on a dotted name imports the parent package, which raises ModuleNotFoundError when
+    # `opentelemetry` is absent (e.g. the minimal test env) rather than returning None. Mirror the
+    # guard in Env._maybe_enable_otel so collection doesn't crash without the otel extra installed.
+    try:
+        return find_spec('opentelemetry.sdk') is not None
+    except ModuleNotFoundError:
+        return False
+
+
+_OTEL_INSTALLED = _otel_installed()
 
 
 def _run_py(code: str, env_overrides: dict[str, str]) -> 'subprocess.CompletedProcess[str]':
