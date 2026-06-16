@@ -57,9 +57,7 @@ def main() -> None:
     print('=== phase 2: sentence-transformer embeddings (batched HF udf, DEBUG) ===')
     t0 = time.perf_counter()
     docs = pxt.create_table('otel_demo.docs', {'text': pxt.String}, if_exists='replace_force')
-    docs.add_computed_column(
-        embed=sentence_transformer(docs.text, model_id='sentence-transformers/all-MiniLM-L6-v2')
-    )
+    docs.add_computed_column(embed=sentence_transformer(docs.text, model_id='sentence-transformers/all-MiniLM-L6-v2'))
     docs.insert({'text': f'pixeltable demo sentence number {i}, about observability'} for i in range(200))
     print(f'    200 docs embedded in {time.perf_counter() - t0:.1f}s')
 
