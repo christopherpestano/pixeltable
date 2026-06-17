@@ -1,9 +1,15 @@
+import pytest
+
 import pixeltable as pxt
 
 from ..utils import get_image_files, skip_test_if_not_installed, validate_update_status
 
 
 class TestYolox:
+    # yolox model weights are downloaded to a process-shared cache (~/.cache/yolox) that lives outside the
+    # per-worker PIXELTABLE_HOME, and pixeltools-yolox has no download lock; concurrent xdist workers race on
+    # the .pth.tmp -> .pth rename. Pin all yolox tests to one worker so the download happens once, serially.
+    @pytest.mark.xdist_group('yolox')
     def test_yolox(self, uses_db: None) -> None:
         skip_test_if_not_installed('yolox')
         from pixeltable.functions.yolox import yolox
