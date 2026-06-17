@@ -24,6 +24,11 @@ from ..utils import get_image_files, get_video_files, pxt_raises, skip_test_if_n
 
 
 class TestVision:
+    # yolox weights download to a process-shared cache outside the per-worker PIXELTABLE_HOME, and
+    # pixeltools-yolox has no download lock; concurrent xdist workers race on the .pth.tmp -> .pth rename.
+    # Share the 'yolox' group (also used in test_yolox.py / test_query.py) so all yolox tests run on one
+    # worker and the download happens once, serially.
+    @pytest.mark.xdist_group('yolox')
     def test_eval(self, uses_db: None) -> None:
         skip_test_if_not_installed('yolox')
         from pixeltable.functions.yolox import yolox
@@ -66,6 +71,7 @@ class TestVision:
             bboxes_draw(v.frame_s, boxes=v.detections_a.bboxes, labels=v.detections_a.labels, fill=True)
         ).collect()
 
+    @pytest.mark.xdist_group('yolox')
     def test_bboxes_draw(self, uses_db: None) -> None:
         skip_test_if_not_installed('yolox')
         from pixeltable.functions.yolox import yolox

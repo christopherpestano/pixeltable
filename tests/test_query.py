@@ -923,6 +923,10 @@ class TestQuery:
         assert isinstance(ds4, PixeltablePytorchDataset)
         assert ds4.path != ds3.path, 'different select list, hence different path should be used'
 
+    # Share the 'yolox' group (see test_yolox.py / test_vision.py): yolox weights download to a process-shared
+    # cache outside the per-worker PIXELTABLE_HOME with no download lock, so concurrent xdist workers race on
+    # the .pth.tmp -> .pth rename. Pinning all yolox tests to one worker serializes the download.
+    @pytest.mark.xdist_group('yolox')
     def test_to_coco(self, uses_db: None) -> None:
         skip_test_if_not_installed('yolox')
         from pycocotools.coco import COCO
