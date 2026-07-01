@@ -117,7 +117,7 @@ _PROC_ENGINE: sql.Engine | None = None
 
 
 def _init_proc(db_url: str, n_threads: int) -> None:
-    global _PROC_ENGINE
+    global _PROC_ENGINE  # noqa: PLW0603
     _PROC_ENGINE = sql.create_engine(db_url, future=True, pool_size=n_threads, max_overflow=0)
 
 
@@ -155,9 +155,13 @@ def backend(request: pytest.FixtureRequest) -> Iterator[tuple[str, str]]:
         s.bind(('127.0.0.1', 0))
         port = s.getsockname()[1]
     container = f'pxt-bench-pg-{port}'
+    # The busiest sweep opens max(_N_PROCESSES) * max(_N_THREADS) pooled connections at once; raise the
+    # server's limit past that (plus headroom for reserved/superuser slots) or it hits "too many clients".
+    max_conns = max(_N_PROCESSES) * max(_N_THREADS) + 16
     subprocess.run(
         ['docker', 'run', '-d', '--rm', '--cpus=1', '--name', container, '-e', 'POSTGRES_PASSWORD=pxt',
-         '-e', 'POSTGRES_DB=pixeltable', '-p', f'{port}:5432', 'pgvector/pgvector:pg16'], check=True
+         '-e', 'POSTGRES_DB=pixeltable', '-p', f'{port}:5432', 'pgvector/pgvector:pg16',
+         '-c', f'max_connections={max_conns}'], check=True
     )  # fmt: skip
     try:
         deadline = time.monotonic() + 90
@@ -172,6 +176,7 @@ def backend(request: pytest.FixtureRequest) -> Iterator[tuple[str, str]]:
         subprocess.run(['docker', 'rm', '-f', container], check=False)
 
 
+@pytest.mark.benchmark
 @pytest.mark.parametrize('n_threads', _N_THREADS)
 @pytest.mark.parametrize('n_procs', _N_PROCESSES)
 def test_db_backend_direct_bench(backend: tuple[str, str], n_procs: int, n_threads: int) -> None:
