@@ -252,3 +252,9 @@ class ExprEvalCtx:
         for i, row in enumerate(rows):
             row.missing_dependents = new_missing_dependents[i]
             row.missing_slots = new_missing_slots[i]
+            # A row that already passed through another ExprEvalNode over the same RowBuilder (eg, the
+            # base and view nodes of a view-load plan) carries is_scheduled flags from that node. A slot
+            # that is missing here needs (re-)evaluation in this node (its value may have been GC'd after
+            # the previous node's consumers finished), so a stale flag would prevent it from ever becoming
+            # ready and hang the row.
+            row.is_scheduled &= ~new_missing_slots[i]

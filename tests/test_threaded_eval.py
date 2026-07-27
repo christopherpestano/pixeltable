@@ -1,6 +1,6 @@
 import threading
 import time
-from typing import Callable
+from typing import Any, Callable
 
 import numpy as np
 import PIL.Image
@@ -154,7 +154,7 @@ class TestImageLoad:
         decode_threads: list[str] = []
         orig_open = PIL.Image.open
 
-        def tracking_open(*args: object, **kwargs: object) -> PIL.Image.Image:
+        def tracking_open(*args: Any, **kwargs: Any) -> PIL.Image.Image:
             decode_threads.append(threading.current_thread().name)
             return orig_open(*args, **kwargs)
 
@@ -174,7 +174,7 @@ class TestImageLoad:
         num_opens = [0]
         orig_open = PIL.Image.open
 
-        def counting_open(*args: object, **kwargs: object) -> PIL.Image.Image:
+        def counting_open(*args: Any, **kwargs: Any) -> PIL.Image.Image:
             num_opens[0] += 1
             return orig_open(*args, **kwargs)
 
@@ -262,7 +262,7 @@ class TestMediaEncode:
         num_saves = [0]
         orig_save = PIL.Image.Image.save
 
-        def counting_save(self: PIL.Image.Image, *args: object, **kwargs: object) -> None:
+        def counting_save(self: PIL.Image.Image, *args: Any, **kwargs: Any) -> None:
             num_saves[0] += 1
             orig_save(self, *args, **kwargs)
 
@@ -313,7 +313,7 @@ class TestMediaLoad:
         decode_threads: list[str] = []
         orig_open = PIL.Image.open
 
-        def tracking_open(*args: object, **kwargs: object) -> PIL.Image.Image:
+        def tracking_open(*args: Any, **kwargs: Any) -> PIL.Image.Image:
             decode_threads.append(threading.current_thread().name)
             return orig_open(*args, **kwargs)
 
