@@ -174,6 +174,38 @@ class TestProxyDaemon:
         assert result == 'ok'
         assert prepare_calls == 1
 
+    def test_r2_part_sink(self, init_env: None, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from pixeltable.service.proxy_client import R2PartSink
+        from pixeltable.utils.object_stores import FileDestination, ObjectOps
+
+        store_uris: list[str] = []
+        uploads: list[tuple[str, bytes]] = []
+
+        class FakeStore:
+            def copy_local_file(self, src_path: pathlib.Path, dest: FileDestination) -> str:
+                uploads.append((dest.remote_key, src_path.read_bytes()))
+                return dest.url
+
+        def fake_get_store(dest: Any, allow_obj_name: bool, col_name: Any = None) -> Any:
+            store_uris.append(dest)
+            return FakeStore()
+
+        monkeypatch.setattr(ObjectOps, 'get_store', staticmethod(fake_get_store))
+        sink = R2PartSink('org1', 'db1')
+        wire = proxy_protocol.serialize_args(self._media_args(tmp_path), sink)
+
+        # a single store, scoped to uploads/ as a whole so its cached client/credentials are shared across
+        # requests; the uploaded object keys carry the per-request prefix
+        assert store_uris == ['pxtfs://org1:db1/home/uploads/']
+        assert sink._key_prefix.startswith('uploads/')
+        row = wire['rows'][0]
+        assert [key for key, _ in uploads] == [row['img_file']['v'], row['img']['v']]
+        assert row['img_file']['v'] == f'{sink._key_prefix}0.png'
+        assert row['img']['v'] == f'{sink._key_prefix}1.png'
+        assert uploads[0][1] == (tmp_path / 'cat.png').read_bytes()
+        # scalar binary values (bytes/ndarray) stay inline
+        assert len(sink.binary_parts) == 2
+
     @staticmethod
     def _install_fake_upload_store(
         monkeypatch: pytest.MonkeyPatch, objects: dict[str, bytes], store_uris: list[str]
@@ -229,9 +261,12 @@ class TestProxyDaemon:
         )
         assert store_uris == []
 
-        # keys outside uploads/ (e.g. persisted store objects) are rejected before any download
+        # keys outside uploads/ (e.g. persisted store objects) are rejected before any download, as are
+        # keys with '..' segments that point outside uploads/
         with pxt_raises(pxt.ErrorCode.INVALID_ARGUMENT):
             proxy_dispatch._prefetch_remote_parts(self._remote_file_request('pixeltable/data/foo.png'))
+        with pxt_raises(pxt.ErrorCode.INVALID_ARGUMENT):
+            proxy_dispatch._prefetch_remote_parts(self._remote_file_request('uploads/../pixeltable/data/foo.png'))
 
         # a missing object is reported as an expired/incomplete upload, naming the key
         with pxt_raises(pxt.ErrorCode.STORAGE_NOT_FOUND, match=r'uploads/req/9\.png.*expired'):

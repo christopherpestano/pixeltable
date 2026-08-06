@@ -133,8 +133,8 @@ def _prefetch_remote_parts(request: ProxyRequest) -> None:
         return
     for remote_key in keys:
         # only client uploads may be localized; anything else (e.g. 'pixeltable/data/...' store objects)
-        # must not be readable through this daemon
-        if not remote_key.startswith('uploads/'):
+        # must not be readable through this daemon, including via '..' segments in the key
+        if not remote_key.startswith('uploads/') or '..' in remote_key:
             raise excs.RequestError(
                 excs.ErrorCode.INVALID_ARGUMENT, f'Invalid uploaded media object key: {remote_key!r}'
             )
