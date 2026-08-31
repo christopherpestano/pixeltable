@@ -95,8 +95,10 @@ class R2PartSink(PartSink):
 
     def _get_store(self) -> ObjectStoreBase:
         if self._store is None:
-            # the prefix in the URI scopes the store's temp credentials to this request's uploads
-            self._store = ObjectOps.get_store(f'pxtfs://{self._org}:{self._db}/home/{self._key_prefix}', False)
+            # scope the store to uploads/ as a whole (not this request's key prefix) so that its cached
+            # client and temp credentials are shared across requests; the uploaded keys themselves still
+            # carry the per-request prefix
+            self._store = ObjectOps.get_store(f'pxtfs://{self._org}:{self._db}/home/uploads/', False)
         return self._store
 
     def add_media_bytes(self, data: bytes, extension: str) -> str:
