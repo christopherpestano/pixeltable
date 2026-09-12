@@ -325,10 +325,17 @@ T = TypeVar('T')
 
 
 def _run_endpoint_op(
-    endpoint_op: Callable[..., T], kwargs: dict[str, Any], tmp_paths: list[Path], url_for_media: Callable[[str], str]
+    endpoint_op: Callable[..., T],
+    kwargs: dict[str, Any],
+    tmp_paths: list[Path],
+    url_for_media: Callable[[str], str],
+    finalize_media: Callable[[], None] | None,
 ) -> T:
     try:
-        return endpoint_op(kwargs, url_for_media)
+        result = endpoint_op(kwargs, url_for_media)
+        if finalize_media is not None:
+            finalize_media()
+        return result
     except Exception as e:
         for p in tmp_paths:
             try:
@@ -373,11 +380,14 @@ class PxtEndpoint:
     def route_type(self) -> Literal['insert', 'update', 'delete', 'compute', 'query']:
         return self.route.spec.route_type
 
-    def _url_for_media(self, request: Request) -> Callable[[str], str]:
-        """The function that turns a local media file of a response into a url the client can fetch.
+    def _url_for_media(self, request: Request) -> tuple[Callable[[str], str], Callable[[], None] | None]:
+        """The function that turns a local media file of a response into a url the client can fetch, plus a
+        finalizer to run after the endpoint op.
 
         A local service serves the file itself, from its /media route. A service in a hosted pod has no route a
         client can reach, so it stages the file in the database's home bucket and signs a url for the object.
+        Signing does not need the object to exist yet, so the staged files upload in one concurrent batch when
+        the finalizer runs.
         """
         hosted = Env.get().hosted_db()
         if hosted is None:
@@ -387,7 +397,7 @@ class PxtEndpoint:
             def serve_locally(rel_path: str) -> str:
                 return f'{media_url_base}{urllib.parse.quote(rel_path, safe="/")}'
 
-            return serve_locally
+            return serve_locally, None
 
         org, db = hosted
         home_dir = self.router._home_dir
@@ -397,14 +407,13 @@ class PxtEndpoint:
 
         def stage_in_home_bucket(rel_path: str) -> str:
             key = sink.add_media_file(str(home_dir / rel_path))
-            sink.flush()
             # signed for an hour, so a client has time to fetch the media after reading the response
             return ObjectOps.presigned_url(f'pxtfs://{org}:{db}/home/{key}', expiration_seconds=3600)
 
-        return stage_in_home_bucket
+        return stage_in_home_bucket, sink.flush
 
     def __call__(self, request: Request, **kwargs: Any) -> Any:
-        url_for_media = self._url_for_media(request)
+        url_for_media, finalize_media = self._url_for_media(request)
 
         # write out uploads while the request is still alive
         tmp_paths: list[Path] = []
@@ -418,12 +427,14 @@ class PxtEndpoint:
 
         if self.route.spec.background:
             job_id = uuid.uuid4().hex
-            fut = self.router._executor.submit(_run_endpoint_op, self.endpoint_op, kwargs, tmp_paths, url_for_media)
+            fut = self.router._executor.submit(
+                _run_endpoint_op, self.endpoint_op, kwargs, tmp_paths, url_for_media, finalize_media
+            )
             with self.router._jobs_lock:
                 self.router._jobs[job_id] = fut
             return BackgroundJobResponse(id=job_id, job_url=str(request.url_for(_JOB_STATUS_ROUTE_NAME, job_id=job_id)))
         else:
-            return _run_endpoint_op(self.endpoint_op, kwargs, tmp_paths, url_for_media)
+            return _run_endpoint_op(self.endpoint_op, kwargs, tmp_paths, url_for_media, finalize_media)
 
 
 class FastAPIRouter(fastapi.APIRouter):
