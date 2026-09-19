@@ -229,6 +229,20 @@ def _await_job(job_url: str, timeout: float = 120.0) -> Any:
 @pytest.mark.db_roots('local', 'cloud', reason='a proxy-daemon database has no service manager of its own')
 @pytest.mark.usefixtures('authenticated_http', 'no_hosted_services')
 class TestService:
+    @pytest.mark.db_roots('local', reason='the schema is generated from the models, so no catalog is read')
+    def test_json_schema(self, cli: PxtRunner, db_root: DatabaseRoot) -> None:
+        """Both verbs that emit JSON describe it: a plan as an object, a listing as an array."""
+        plan = json.loads(cli('service', 'diff', '--json-schema').stdout)
+        assert plan['title'] == 'ServicePlan'
+        # computed fields reach the output, so they have to reach the schema too
+        assert 'in_agreement' in plan['properties']
+        assert 'summary' in plan['properties']
+        assert plan['$defs']['ServicePlanSummary']['properties']['restarts']['description'] != ''
+
+        listing = json.loads(cli('service', 'list', '--json-schema').stdout)
+        assert listing['type'] == 'array'
+        assert 'ServiceInstance' in listing['$defs']
+
     def test_config_must_agree(self, cli: PxtRunner, apps: Callable[[str], str], db_root: DatabaseRoot) -> None:
         """A service inherits the daemon's config values, so a caller resolving them differently cannot deploy."""
         skip_test_if_not_installed('fastapi')
@@ -1101,7 +1115,7 @@ class TestService:
         _db_update(cli, db_root)
         r = cli('service', 'update', str(two), target, '-f', '--port', '8123', check=False)
         assert r.returncode == 1
-        assert '--port names one port' in r.stderr, r.stderr
+        assert '--port takes one port' in r.stderr, r.stderr
         assert get_services(cli, target) == {}, 'a refused update started nothing'
 
         r = cli('service', 'update', str(two), target, 'third', '-f', check=False)
