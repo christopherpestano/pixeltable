@@ -1389,6 +1389,10 @@ class TestTable:
             t.compute([{'id': 1}], outputs=['nope'])
         with pxt_raises(pxt.ErrorCode.MISSING_REQUIRED, match='At least one output column'):
             t.compute([{'id': 1}], outputs=[])
+        # a column reference from another table is rejected even when the name matches
+        other = pxt.create_table(p('test_compute_other'), {'plus1': pxt.String})
+        with pxt_raises(pxt.ErrorCode.COLUMN_NOT_FOUND, match="'plus1' belongs to a different table"):
+            t.compute([{'id': 1}], outputs=[other.plus1])
 
         # a row must supply the required (non-nullable) columns that the requested outputs read
         r = pxt.create_table(p('test_compute_required'), {'req': pxt.Int, 'x': pxt.Int | None})
