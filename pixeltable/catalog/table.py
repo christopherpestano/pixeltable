@@ -1030,6 +1030,10 @@ class Table(SchemaObject):
             col_md = self._tbl_path.get_column_md_by_name(name)
             if col_md is None:
                 raise excs.NotFoundError(excs.ErrorCode.COLUMN_NOT_FOUND, f'Unknown column: {name}')
+            if not isinstance(output, str) and output.col_md.qcolid != col_md.qcolid:
+                raise excs.NotFoundError(
+                    excs.ErrorCode.COLUMN_NOT_FOUND, f'Column {name!r} belongs to a different table'
+                )
             result.append(col_md)
         return result
 
