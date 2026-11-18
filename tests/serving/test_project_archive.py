@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import bz2
+import contextlib
 import gzip
 import io
 import logging
@@ -11,6 +12,7 @@ import sys
 import tarfile
 import tempfile
 import textwrap
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +51,13 @@ else:
     from backports import zstd
 
 
+@contextlib.contextmanager
+def read_archive(archive: Path) -> Iterator[tarfile.TarFile]:
+    """archive, open for reading the way a pod reads it."""
+    with archive.open('rb') as f, open_project_archive(f, stream=False) as tar:
+        yield tar
+
+
 def local_entry() -> DatabaseConfig | None:
     """The project's entry for the local database, which selects the files an archive holds."""
     return Config.get().get_database_config(PxtPath.parse('', allow_empty_path=True))
@@ -73,7 +82,7 @@ class TestProjectArchive:
 
         archive_path = create_project_archive(tmp_path)
 
-        with tarfile.open(archive_path, 'r:bz2') as tar:
+        with read_archive(archive_path) as tar:
             assert sorted(tar.getnames()) == ['project/subdir/helper.py', 'project/udfs.py']
             with tar.extractfile(tar.getmember('project/udfs.py')) as f:
                 assert f.read().decode() == 'import pixeltable as pxt\n'
@@ -96,7 +105,7 @@ class TestProjectArchive:
 
         archive_path = create_project_archive(tmp_path, local_entry())
 
-        with tarfile.open(archive_path, 'r:bz2') as tar:
+        with read_archive(archive_path) as tar:
             members = tar.getnames()
             assert 'project/a_include.txt' in members
             assert 'project/a_include.py' in members
@@ -116,7 +125,7 @@ class TestProjectArchive:
 
         archive_path = create_project_archive(tmp_path)
 
-        with tarfile.open(archive_path, 'r:bz2') as tar:
+        with read_archive(archive_path) as tar:
             members = tar.getnames()
             assert 'project/app.py' in members
             assert not any('__pycache__' in m for m in members)
@@ -132,7 +141,7 @@ class TestProjectArchive:
 
         archive_path = create_project_archive(tmp_path)
 
-        with tarfile.open(archive_path, 'r:bz2') as tar:
+        with read_archive(archive_path) as tar:
             assert 'project/uv.lock' in tar.getnames()
             assert 'project/pyproject.toml' in tar.getnames()
             # no root-level requirements.txt or runtime_config.json
@@ -154,11 +163,14 @@ class TestProjectArchive:
         assert entry is not None
         assert entry.system_dependencies == ['ffmpeg', 'libpq']
 
-    def test_is_valid_bz2_tar(self, init_env: None, tmp_path: Path) -> None:
-        """The output file is a valid bz2 tarball."""
+    def test_is_valid_zstd_tar(self, init_env: None, tmp_path: Path) -> None:
+        """The output file is a zstd tarball: zstd compresses and decompresses several times faster than bz2."""
+        (tmp_path / 'app.py').write_text('x = 1\n')
         archive_path = create_project_archive(tmp_path)
-        assert tarfile.is_tarfile(archive_path)
-        assert archive_path.suffix == '.bz2'
+        assert archive_path.suffix == '.zst'
+        assert archive_path.read_bytes().startswith(b'\x28\xb5\x2f\xfd')
+        with read_archive(archive_path) as tar:
+            assert tar.getnames() == ['project/app.py']
 
     @pytest.mark.parametrize('stream', [True, False], ids=['stream', 'seekable'])
     @pytest.mark.parametrize('compress', [bz2.compress, zstd.compress], ids=['bz2', 'zstd'])
@@ -219,7 +231,7 @@ class TestProjectArchive:
             archive_path = create_project_archive(tmp_path)
         assert 'No dependency lockfile' in caplog.text
 
-        with tarfile.open(archive_path, 'r:bz2') as tar:
+        with read_archive(archive_path) as tar:
             members = tar.getnames()
         assert 'project/udfs.py' in members
         assert all('conda' not in member for member in members)
@@ -273,7 +285,7 @@ class TestProjectArchive:
         monkeypatch.setattr('pixeltable.utils.project._archive_files', list_then_remove)
         archive = package_project_archive(tmp_path)
         assert list(archive.files) == ['app.py']
-        with tarfile.open(archive.path, 'r:bz2') as tar:
+        with read_archive(archive.path) as tar:
             assert tar.getnames() == ['project/app.py']
 
     def test_shrinks_while_packaging(self, init_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -527,7 +539,7 @@ class TestProjectArchive:
         (tmp_path / 'pixeltable.toml').write_text('[[pixeltable.database]]\nexclude = ["dist/*"]\n')
         Config.init(reinit=True, project_root=tmp_path)
 
-        with tarfile.open(create_project_archive(tmp_path, local_entry()), 'r:bz2') as tar:
+        with read_archive(create_project_archive(tmp_path, local_entry())) as tar:
             assert 'project/dist/dep.whl' in tar.getnames()
 
     def test_manifest_drift(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

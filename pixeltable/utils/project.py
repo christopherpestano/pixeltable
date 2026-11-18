@@ -49,6 +49,10 @@ LOCK_FILES: dict[str, DepsType] = {'uv.lock': 'uv', 'requirements.txt': 'pip'}
 
 IMAGE_INPUT_FILES: tuple[str, ...] = (*LOCK_FILES, PYPROJECT_FILE)
 
+# zstd's level for new archives. Level 9 packages several times faster than bz2 did and compresses text 10-20%
+# smaller than level 3, which matters because the control plane caps an archive's size.
+_ARCHIVE_ZSTD_LEVEL = 9
+
 
 def _resolve_patterns(project_dir: Path, patterns: list[str]) -> set[Path]:
     """Files under project_dir matching patterns, which use git wildmatch syntax (`*`, `**`, `!`, `dir/`)."""
@@ -376,14 +380,15 @@ def package_project_archive(
             "run 'uv lock', or write a requirements.txt."
         )
 
-    fd, name = tempfile.mkstemp(suffix='.tar.bz2', prefix='pxt_project_')
+    fd, name = tempfile.mkstemp(suffix='.tar.zst', prefix='pxt_project_')
     os.close(fd)
     archive_path = Path(name)
 
     max_pathlen = 40
     try:
         with (
-            tarfile.open(archive_path, 'w:bz2') as tf,
+            zstd.ZstdFile(archive_path, 'w', level=_ARCHIVE_ZSTD_LEVEL) as compressed,
+            tarfile.open(fileobj=compressed, mode='w') as tf,
             tqdm(desc='Packaging project', total=len(files), unit=' files', disable=not show_progress) as bar,
         ):
             hashes: dict[str, str] = {}
