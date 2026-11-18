@@ -9,10 +9,12 @@ any other failure.
 
 from __future__ import annotations
 
+import bz2
 import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import pytest
@@ -23,6 +25,11 @@ from pixeltable.service import prepare_project
 from pixeltable.utils.project import package_project_archive, project_fingerprint, unpacked_digest
 
 from ..utils import pxt_raises
+
+if sys.version_info >= (3, 14):
+    from compression import zstd
+else:
+    from backports import zstd
 
 _DB_URI = 'pxt://acme:main'
 
@@ -184,11 +191,13 @@ class TestPrepareProject:
 
 
 class TestUnpack:
-    def test_round_trip(self, init_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.parametrize('compress', [bz2.compress, zstd.compress], ids=['bz2', 'zstd'])
+    def test_round_trip(self, init_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, compress: Any) -> None:
         """Unpacking an archive yields the project it was packaged from, whatever shapes its files take.
 
         unpack_project_archive() checks the unpacked project against the served digest, so serving this
-        project's own digest makes the call itself the assertion.
+        project's own digest makes the call itself the assertion. A pod pinned to a release made before
+        archives were zstd still unpacks its bz2 archive, so both are served.
         """
         project = tmp_path / 'project'
         (project / 'pkg').mkdir(parents=True)
@@ -201,10 +210,14 @@ class TestUnpack:
         )
 
         packaged = package_project_archive(project)
+        data = packaged.path.read_bytes()
+        tar = zstd.decompress(data) if data.startswith(b'\x28\xb5\x2f\xfd') else bz2.decompress(data)
+        served_archive = tmp_path / 'served'
+        served_archive.write_bytes(compress(tar))
         project_config = {'pixeltable': {'database': [{'name': 'pxt://acme:main'}]}}
         fingerprint = project_fingerprint(project, None, project_config=project_config)
         served = {
-            'presigned_url': packaged.path.as_uri(),
+            'presigned_url': served_archive.as_uri(),
             'digest': fingerprint.archive_digest(),
             'fingerprint': fingerprint.model_dump(mode='json'),
         }

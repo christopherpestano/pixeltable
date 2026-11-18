@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import bz2
+import gzip
+import io
 import logging
 import os
+import sys
 import tarfile
 import tempfile
 import textwrap
@@ -29,6 +33,7 @@ from pixeltable.utils.project import (
     create_image_context,
     create_project_archive,
     image_input_files,
+    open_project_archive,
     package_image_context,
     package_project_archive,
     project_fingerprint,
@@ -37,6 +42,11 @@ from pixeltable.utils.project import (
 from pixeltable_cli.types import DbPlan
 
 from ..utils import pxt_raises
+
+if sys.version_info >= (3, 14):
+    from compression import zstd
+else:
+    from backports import zstd
 
 
 def local_entry() -> DatabaseConfig | None:
@@ -149,6 +159,52 @@ class TestProjectArchive:
         archive_path = create_project_archive(tmp_path)
         assert tarfile.is_tarfile(archive_path)
         assert archive_path.suffix == '.bz2'
+
+    @pytest.mark.parametrize('stream', [True, False], ids=['stream', 'seekable'])
+    @pytest.mark.parametrize('compress', [bz2.compress, zstd.compress], ids=['bz2', 'zstd'])
+    def test_open_either_compression(self, tmp_path: Path, compress: Any, stream: bool) -> None:
+        """Stored archives and released clients are bz2 and new archives are zstd, so a reader takes either.
+
+        The file is read by its bytes alone: its name says nothing about the format.
+        """
+        raw = io.BytesIO()
+        with tarfile.open(fileobj=raw, mode='w') as tf:
+            for name, data in (('project/app.py', b'x = 1\n'), ('project/data.bin', os.urandom(300_000))):
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+        path = tmp_path / 'archive'
+        path.write_bytes(compress(raw.getvalue()))
+
+        with path.open('rb') as f, open_project_archive(f, stream=stream) as tf:
+            if stream:
+                read = {m.name: tf.extractfile(m).read() for m in tf}
+            else:
+                # the seekable mode reads every header first, then seeks back to a member's data
+                members = tf.getmembers()
+                read = {m.name: tf.extractfile(m).read() for m in reversed(members)}
+        with tarfile.open(fileobj=io.BytesIO(raw.getvalue())) as tf:
+            assert read == {m.name: tf.extractfile(m).read() for m in tf}
+
+    def test_open_refuses_other_data(self, tmp_path: Path) -> None:
+        """Data in neither format, and zstd data the decoder refuses, raise the tarfile error callers already handle."""
+        # a zstd frame header with its reserved bit set
+        reserved = b'\x28\xb5\x2f\xfd\x08' + bytes(16)
+        path = tmp_path / 'archive'
+        for data, stream, match in (
+            (gzip.compress(b'x'), True, 'neither bz2 nor zstd'),
+            (b'', False, 'neither bz2 nor zstd'),
+            (reserved, True, 'corrupt zstd data'),
+            (reserved, False, 'corrupt zstd data'),
+        ):
+            path.write_bytes(data)
+            with (
+                pytest.raises(tarfile.ReadError, match=match),
+                path.open('rb') as f,
+                open_project_archive(f, stream=stream) as tf,
+            ):
+                for member in tf:
+                    tf.extractfile(member).read()
 
     def test_no_lockfile(self, init_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: Any) -> None:
         """A project with no lockfile draws a warning and is packaged anyway; a conda environment is not a lockfile."""

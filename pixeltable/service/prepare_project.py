@@ -39,7 +39,7 @@ from pixeltable.config import PROJECT_CONFIG_FILE
 from pixeltable.service import management_client
 from pixeltable.service.db import _validated_db_uri
 from pixeltable.service.management_protocol import GetArchiveRequest, GetArchiveResponse
-from pixeltable.utils.project import unpacked_digest
+from pixeltable.utils.project import open_project_archive, unpacked_digest
 
 PROJECT_SUBDIR = 'project'
 FINGERPRINT_FILE = 'fingerprint.json'
@@ -94,7 +94,8 @@ def unpack_project_archive(
     dest.parent.mkdir(parents=True, exist_ok=True)
     # staged next to dest and moved into place, so that dest ends up with exactly the archive's files
     unpacking = Path(tempfile.mkdtemp(dir=dest.parent, prefix=f'.{dest.name}.'))
-    archive_path = unpacking / 'project.tar.bz2'
+    # bz2 or zstd: open_project_archive() reads the format from the bytes
+    archive_path = unpacking / 'project.archive'
     try:
         # streamed to disk: a project's files may be too large for memory
         with (
@@ -106,7 +107,7 @@ def unpack_project_archive(
         staged = unpacking / _TARBALL_ROOT
         staged.mkdir()  # an empty archive still unpacks to an empty project
         prefix = f'{_TARBALL_ROOT}/'
-        with tarfile.open(archive_path, mode='r:bz2') as tf:
+        with archive_path.open('rb') as archive, open_project_archive(archive, stream=False) as tf:
             members: list[tarfile.TarInfo] = []
             for member in tf.getmembers():
                 if member.name == _TARBALL_ROOT:

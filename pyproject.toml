@@ -76,6 +76,8 @@ dependencies = [
     "psutil>=5.9",
     "tqdm>=4.64",
     "typing-extensions>=4.15",
+    # zstd for project archives, which the standard library has only from 3.14 (compression.zstd)
+    "backports.zstd>=1.0 ; python_version < '3.14'",
 ]
 
 [project.optional-dependencies]

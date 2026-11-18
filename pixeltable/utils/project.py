@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import bz2
+import contextlib
 import dataclasses
 import datetime
 import enum
@@ -17,7 +19,7 @@ import sysconfig
 import tarfile
 import tempfile
 import tomllib
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any, BinaryIO, Literal
 
@@ -31,6 +33,11 @@ from pixeltable import exceptions as excs
 from pixeltable.config import PROJECT_CONFIG_FILE, PYPROJECT_FILE, Config, ConfigSections, DatabaseConfig
 from pixeltable.env import Env
 from pixeltable_cli.utils import project_root_error
+
+if sys.version_info >= (3, 14):
+    from compression import zstd
+else:
+    from backports import zstd
 
 _logger = logging.getLogger('pixeltable')
 
@@ -397,6 +404,45 @@ def package_project_archive(
 
     _logger.info(f'Project archive created: {archive_path}')
     return PackagedContext(path=archive_path, files=hashes)
+
+
+# the first bytes of each compression a project archive may use
+_BZ2_MAGIC = b'BZh'
+_ZSTD_MAGIC = b'\x28\xb5\x2f\xfd'
+
+
+@contextlib.contextmanager
+def open_project_archive(
+    fileobj: io.BufferedReader, *, stream: bool, tarinfo: type[tarfile.TarInfo] = tarfile.TarInfo
+) -> Iterator[tarfile.TarFile]:
+    """Open a project archive for reading, as bz2 or zstd according to its first bytes.
+
+    Stored archives, and those released clients upload, may be bz2 rather than zstd, so a reader takes either.
+
+    Args:
+        fileobj: The archive, positioned at its start.
+        stream: Read the members once, in order, as tarfile's `r|` does. Otherwise read as `r:`, which may seek
+            back, at the cost of decompressing again.
+        tarinfo: The TarInfo class that parses each member header.
+
+    Raises:
+        tarfile.ReadError: The archive is neither bz2 nor zstd, or its zstd data is corrupt.
+    """
+    magic = fileobj.peek(len(_ZSTD_MAGIC))[: len(_ZSTD_MAGIC)]
+    decompressed: bz2.BZ2File | zstd.ZstdFile
+    if magic.startswith(_BZ2_MAGIC):
+        decompressed = bz2.BZ2File(fileobj)
+    elif magic == _ZSTD_MAGIC:
+        decompressed = zstd.ZstdFile(fileobj)
+    else:
+        raise tarfile.ReadError('the archive is neither bz2 nor zstd')
+    mode: Literal['r|', 'r:'] = 'r|' if stream else 'r:'
+    try:
+        with decompressed, tarfile.open(fileobj=decompressed, mode=mode, tarinfo=tarinfo) as tf:
+            yield tf
+    except zstd.ZstdError as e:
+        # bz2 reports corrupt data as OSError, which callers handle; ZstdError is neither that nor a TarError
+        raise tarfile.ReadError(f'corrupt zstd data: {e}') from e
 
 
 # what pip installs from a file rather than an index, named without a directory
